@@ -4,28 +4,22 @@
 
 #include <stdio.h>
 
-#if defined(__aarch64__)
-#define CDBG_TRAP_BYTE 0xd4  /* BRK #0 */
-#elif defined(__x86_64__)
-#define CDBG_TRAP_BYTE 0xcc  /* INT3 */
-#else
-#error "Unsupported architecture"
-#endif
+#define CDBG_TRAP_INST 0xd4200000U  /* BRK #0 */
 
 int cdbg_bp_enable(cdbg_breakpoint_t *bp, pid_t pid, uintptr_t addr)
 {
-    uint8_t byte = 0;
+    uint32_t inst = 0;
 
-    if (cdbg_mem_read(pid, addr, &byte, 1) != 0) {
+    if (cdbg_mem_read(pid, addr, &inst, sizeof(inst)) != 0) {
         return -1;
     }
 
     bp->addr = addr;
-    bp->saved_byte = byte;
+    bp->saved_inst = inst;
     bp->enabled = true;
 
-    uint8_t trap = CDBG_TRAP_BYTE;
-    if (cdbg_mem_write(pid, addr, &trap, 1) != 0) {
+    uint32_t trap = CDBG_TRAP_INST;
+    if (cdbg_mem_write(pid, addr, &trap, sizeof(trap)) != 0) {
         bp->enabled = false;
         return -1;
     }
@@ -39,7 +33,7 @@ int cdbg_bp_disable(cdbg_breakpoint_t *bp, pid_t pid)
         return 0;
     }
 
-    if (cdbg_mem_write(pid, bp->addr, &bp->saved_byte, 1) != 0) {
+    if (cdbg_mem_write(pid, bp->addr, &bp->saved_inst, sizeof(bp->saved_inst)) != 0) {
         return -1;
     }
 
@@ -52,11 +46,7 @@ bool cdbg_bp_matches_pc(uintptr_t pc, const cdbg_breakpoint_t *bp)
     if (!bp->enabled) {
         return false;
     }
-#if defined(__x86_64__)
-    return bp->addr + 1 == pc;
-#else
     return bp->addr == pc;
-#endif
 }
 
 bool cdbg_bp_is_trap(uintptr_t pc, const cdbg_breakpoint_t *bps, size_t count)

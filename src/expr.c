@@ -252,10 +252,17 @@ static bool expect(parser_t *p, tok_type_t type)
     return true;
 }
 
+typedef enum cdbg_var_base {
+    CDBG_VAR_BASE_FB,
+    CDBG_VAR_BASE_SP,
+    CDBG_VAR_BASE_X29,
+} cdbg_var_base_t;
+
 typedef struct cdbg_var_info {
     char name[128];
     char type[128];
     int64_t fbreg_offset;
+    cdbg_var_base_t base;
     size_t size;
     size_t pointee_size;
     bool has_location;
@@ -291,8 +298,24 @@ static int resolve_variable_address(cdbg_t *dbg, const char *name,
     memset(var, 0, sizeof(*var));
     *found_local = find_local_var(dbg, name, var) == 0;
     if (*found_local) {
-        uintptr_t fp = cdbg_regs_fp(&dbg->regs);
-        *addr = (uintptr_t)((int64_t)fp + var->fbreg_offset);
+        uintptr_t base_addr;
+        switch (var->base) {
+        case CDBG_VAR_BASE_SP:
+            {
+                uint64_t sp = 0;
+                if (cdbg_regs_get_by_name(&dbg->regs, "sp", &sp) != 0) {
+                    return -1;
+                }
+                base_addr = (uintptr_t)sp;
+            }
+            break;
+        case CDBG_VAR_BASE_X29:
+        case CDBG_VAR_BASE_FB:
+        default:
+            base_addr = cdbg_regs_fp(&dbg->regs);
+            break;
+        }
+        *addr = (uintptr_t)((int64_t)base_addr + var->fbreg_offset);
         return 0;
     }
 
@@ -923,16 +946,42 @@ static int parse_hex_value(const char *line, uintptr_t *out)
     return 0;
 }
 
-static int parse_fbreg_offset(const char *line, int64_t *out)
+static int parse_fbreg_offset(const char *line, int64_t *out,
+                              cdbg_var_base_t *base)
 {
-    const char *fbreg = strstr(line, "DW_OP_fbreg");
-    if (fbreg == NULL) {
+    const char *p = strstr(line, "DW_OP_fbreg");
+    if (p != NULL) {
+        *base = CDBG_VAR_BASE_FB;
+        p += strlen("DW_OP_fbreg");
+    } else {
+        p = strstr(line, "DW_OP_breg");
+        if (p == NULL) {
+            return -1;
+        }
+        p += strlen("DW_OP_breg");
+        char *end = NULL;
+        long reg = strtol(p, &end, 10);
+        if (end == p) {
+            return -1;
+        }
+        p = end;
+        if (reg == 31) {
+            *base = CDBG_VAR_BASE_SP;
+        } else if (reg == 29) {
+            *base = CDBG_VAR_BASE_X29;
+        } else {
+            return -1;
+        }
+    }
+
+    p = strpbrk(p, "+-0123456789");
+    if (p == NULL) {
         return -1;
     }
 
     char *end = NULL;
-    long long value = strtoll(fbreg + strlen("DW_OP_fbreg"), &end, 10);
-    if (end == fbreg + strlen("DW_OP_fbreg")) {
+    long long value = strtoll(p, &end, 10);
+    if (end == p) {
         return -1;
     }
 
@@ -1065,7 +1114,7 @@ static int find_local_var(cdbg_t *dbg, const char *name, cdbg_var_info_t *out)
             continue;
         }
         if (strstr(line, "DW_AT_location") != NULL &&
-            parse_fbreg_offset(line, &var.fbreg_offset) == 0) {
+            parse_fbreg_offset(line, &var.fbreg_offset, &var.base) == 0) {
             var.has_location = true;
         } else if (strstr(line, "DW_AT_name") != NULL) {
             (void)parse_quoted_value(line, var.name, sizeof(var.name));

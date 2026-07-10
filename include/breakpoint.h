@@ -7,7 +7,7 @@
 
 typedef struct cdbg_breakpoint {
     uintptr_t addr;
-    uint8_t saved_byte;
+    uint32_t saved_inst;
     bool enabled;
 } cdbg_breakpoint_t;
 

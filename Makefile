@@ -24,7 +24,9 @@ all: $(TARGET)
 examples: $(TARGET) build/target
 
 build/target: examples/target.c | build
-	$(CC) -g -o $@ $<
+	$(CC) -g -c -o build/target.o $<
+	$(CC) -g -o $@ build/target.o
+	dsymutil -o $@.dSYM $@
 
 $(TARGET): $(OBJS) | build
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)

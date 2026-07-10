@@ -287,8 +287,8 @@ static int run_to_entry_stop(cdbg_t *dbg)
     uintptr_t pc = cdbg_regs_pc(&dbg->regs);
     if (cdbg_bp_matches_pc(pc, &temp_bp)) {
         (void)cdbg_bp_disable(&temp_bp, dbg->pid);
-        if (pc > 0) {
-            (void)cdbg_regs_set_pc(&dbg->regs, pc - 1);
+        if (entry_addr > 0) {
+            (void)cdbg_regs_set_pc(&dbg->regs, entry_addr);
             if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
                 return -1;
             }
@@ -498,14 +498,20 @@ static int step_over_disabled_breakpoint(cdbg_t *dbg)
     }
 
     uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    fprintf(stderr, "[debug] step_over: pc=0x%lx, state=%d\n", (unsigned long)pc, dbg->state);
     if (disabled_breakpoint_at_pc(dbg, pc) == NULL) {
+        fprintf(stderr, "[debug] step_over: no disabled bp at pc\n");
         return 0;
     }
 
+    fprintf(stderr, "[debug] step_over: doing single step\n");
     if (cdbg_single_step(dbg) != 0) {
         return -1;
     }
-    return cdbg_wait(dbg);
+    int rc = cdbg_wait(dbg);
+    uintptr_t pc2 = cdbg_regs_pc(&dbg->regs);
+    fprintf(stderr, "[debug] step_over: after step pc=0x%lx rc=%d state=%d\n", (unsigned long)pc2, rc, dbg->state);
+    return rc;
 }
 
 int cdbg_continue(cdbg_t *dbg)
@@ -514,10 +520,12 @@ int cdbg_continue(cdbg_t *dbg)
     if (step_rc != 0) {
         return step_rc;
     }
+    fprintf(stderr, "[debug] cdbg_continue: state=%d\n", dbg->state);
     if (dbg->state == CDBG_STATE_IDLE) {
         return 0;
     }
 
+    fprintf(stderr, "[debug] cdbg_continue: calling PT_CONTINUE\n");
     if (ptrace(PT_CONTINUE, dbg->pid, (caddr_t)1, 0) == -1) {
         perror("ptrace(PT_CONTINUE)");
         return -1;
@@ -542,16 +550,6 @@ int cdbg_single_step(cdbg_t *dbg)
 
 static int call_return_address(cdbg_t *dbg, uintptr_t pc, uintptr_t *return_addr)
 {
-#if defined(__x86_64__)
-    uint8_t opcode = 0;
-    if (cdbg_mem_read(dbg->pid, pc, &opcode, sizeof(opcode)) != 0) {
-        return -1;
-    }
-    if (opcode == 0xe8) {
-        *return_addr = pc + 5;
-        return 0;
-    }
-#elif defined(__aarch64__)
     uint32_t insn = 0;
     if (cdbg_mem_read(dbg->pid, pc, &insn, sizeof(insn)) != 0) {
         return -1;
@@ -560,7 +558,6 @@ static int call_return_address(cdbg_t *dbg, uintptr_t pc, uintptr_t *return_addr
         *return_addr = pc + 4;
         return 0;
     }
-#endif
     return -1;
 }
 
@@ -581,12 +578,6 @@ static int finish_temp_breakpoint(cdbg_t *dbg, cdbg_breakpoint_t *temp_bp)
         return -1;
     }
 
-#if defined(__x86_64__)
-    (void)cdbg_regs_set_pc(&dbg->regs, temp_bp->addr);
-    if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
-        return -1;
-    }
-#endif
     return 0;
 }
 
@@ -765,128 +756,6 @@ static int print_otool_disassembly(cdbg_t *dbg, uintptr_t runtime_pc)
     return print_otool_disassembly_range(dbg, runtime_pc, 1, NULL);
 }
 
-static const char *x86_reg64(unsigned int reg)
-{
-    static const char *names[] = {
-        "%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi"
-    };
-    return names[reg & 7U];
-}
-
-static int64_t read_i32_le(const uint8_t *p)
-{
-    uint32_t value = (uint32_t)p[0] |
-                     ((uint32_t)p[1] << 8) |
-                     ((uint32_t)p[2] << 16) |
-                     ((uint32_t)p[3] << 24);
-    return (int32_t)value;
-}
-
-static size_t decode_x86_64_instruction(uintptr_t pc, const uint8_t *bytes,
-                                        size_t len, char *out, size_t out_len)
-{
-    if (len == 0) {
-        return 0;
-    }
-
-    if (bytes[0] == 0x55) {
-        snprintf(out, out_len, "pushq %%rbp");
-        return 1;
-    }
-    if (bytes[0] == 0x5d) {
-        snprintf(out, out_len, "popq %%rbp");
-        return 1;
-    }
-    if (bytes[0] == 0xc3) {
-        snprintf(out, out_len, "retq");
-        return 1;
-    }
-    if (bytes[0] == 0x90) {
-        snprintf(out, out_len, "nop");
-        return 1;
-    }
-    if (bytes[0] == 0xcc) {
-        snprintf(out, out_len, "int3");
-        return 1;
-    }
-    if (bytes[0] == 0x6a && len >= 2) {
-        snprintf(out, out_len, "pushq $0x%02x", bytes[1]);
-        return 2;
-    }
-    if (bytes[0] == 0xe8 && len >= 5) {
-        uintptr_t target = pc + 5 + read_i32_le(bytes + 1);
-        snprintf(out, out_len, "callq 0x%lx", (unsigned long)target);
-        return 5;
-    }
-    if (bytes[0] == 0xe9 && len >= 5) {
-        uintptr_t target = pc + 5 + read_i32_le(bytes + 1);
-        snprintf(out, out_len, "jmp 0x%lx", (unsigned long)target);
-        return 5;
-    }
-    if (bytes[0] == 0xeb && len >= 2) {
-        uintptr_t target = pc + 2 + (int8_t)bytes[1];
-        snprintf(out, out_len, "jmp 0x%lx", (unsigned long)target);
-        return 2;
-    }
-    if ((bytes[0] == 0x74 || bytes[0] == 0x75) && len >= 2) {
-        uintptr_t target = pc + 2 + (int8_t)bytes[1];
-        snprintf(out, out_len, "%s 0x%lx", bytes[0] == 0x74 ? "je" : "jne",
-                 (unsigned long)target);
-        return 2;
-    }
-    if (bytes[0] == 0x0f && len >= 6 && (bytes[1] == 0x84 || bytes[1] == 0x85)) {
-        uintptr_t target = pc + 6 + read_i32_le(bytes + 2);
-        snprintf(out, out_len, "%s 0x%lx", bytes[1] == 0x84 ? "je" : "jne",
-                 (unsigned long)target);
-        return 6;
-    }
-
-    if (bytes[0] == 0x48 && len >= 3) {
-        uint8_t op = bytes[1];
-        uint8_t modrm = bytes[2];
-        unsigned int mod = (modrm >> 6) & 3U;
-        unsigned int reg = (modrm >> 3) & 7U;
-        unsigned int rm = modrm & 7U;
-
-        if (op == 0x89 && mod == 3) {
-            snprintf(out, out_len, "movq %s, %s", x86_reg64(reg), x86_reg64(rm));
-            return 3;
-        }
-        if (op == 0x8b && mod == 3) {
-            snprintf(out, out_len, "movq %s, %s", x86_reg64(rm), x86_reg64(reg));
-            return 3;
-        }
-        if (op == 0x83 && len >= 4 && mod == 3) {
-            const char *mnemonic = NULL;
-            if (reg == 0) {
-                mnemonic = "addq";
-            } else if (reg == 4) {
-                mnemonic = "andq";
-            } else if (reg == 5) {
-                mnemonic = "subq";
-            } else if (reg == 7) {
-                mnemonic = "cmpq";
-            }
-            if (mnemonic != NULL) {
-                snprintf(out, out_len, "%s $0x%x, %s", mnemonic, bytes[3],
-                         x86_reg64(rm));
-                return 4;
-            }
-        }
-        if (op == 0xc7 && len >= 7 && mod == 3 && reg == 0) {
-            uint32_t imm = (uint32_t)bytes[3] |
-                           ((uint32_t)bytes[4] << 8) |
-                           ((uint32_t)bytes[5] << 16) |
-                           ((uint32_t)bytes[6] << 24);
-            snprintf(out, out_len, "movq $0x%x, %s", imm, x86_reg64(rm));
-            return 7;
-        }
-    }
-
-    snprintf(out, out_len, ".byte 0x%02x", bytes[0]);
-    return 1;
-}
-
 static void print_memory_disassembly_range(cdbg_t *dbg, uintptr_t pc, size_t insn_count,
                                            const char *label)
 {
@@ -905,11 +774,6 @@ static void print_memory_disassembly_range(cdbg_t *dbg, uintptr_t pc, size_t ins
     for (size_t n = 0; n < insn_count && offset < sizeof(bytes); n++) {
         char text[128];
         size_t used = 0;
-#if defined(__x86_64__)
-        used = decode_x86_64_instruction(pc + offset, bytes + offset,
-                                         sizeof(bytes) - offset,
-                                         text, sizeof(text));
-#elif defined(__aarch64__)
         if (sizeof(bytes) - offset >= 4) {
             uint32_t insn = (uint32_t)bytes[offset] |
                             ((uint32_t)bytes[offset + 1] << 8) |
@@ -918,7 +782,6 @@ static void print_memory_disassembly_range(cdbg_t *dbg, uintptr_t pc, size_t ins
             snprintf(text, sizeof(text), ".inst 0x%08x", insn);
             used = 4;
         }
-#endif
         if (used == 0) {
             snprintf(text, sizeof(text), ".byte 0x%02x", bytes[offset]);
             used = 1;
@@ -1190,9 +1053,8 @@ static int handle_breakpoint_hit(cdbg_t *dbg, size_t index)
         return -1;
     }
 
-    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
-    if (pc > 0) {
-        (void)cdbg_regs_set_pc(&dbg->regs, pc - 1);
+    if (bp->addr > 0) {
+        (void)cdbg_regs_set_pc(&dbg->regs, bp->addr);
         if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
             return -1;
         }
@@ -1269,11 +1131,18 @@ typedef struct cdbg_struct_member {
     bool is_signed;
 } cdbg_struct_member_t;
 
+typedef enum cdbg_var_base {
+    CDBG_VAR_BASE_FB,
+    CDBG_VAR_BASE_SP,
+    CDBG_VAR_BASE_X29,
+} cdbg_var_base_t;
+
 typedef struct cdbg_var_info {
     char name[128];
     char type[128];
     char element_type[128];
     int64_t fbreg_offset;
+    cdbg_var_base_t base;
     size_t size;
     size_t element_size;
     size_t pointee_size;
@@ -1333,16 +1202,42 @@ static int parse_hex_value(const char *line, uintptr_t *out)
     return 0;
 }
 
-static int parse_fbreg_offset(const char *line, int64_t *out)
+static int parse_fbreg_offset(const char *line, int64_t *out,
+                              cdbg_var_base_t *base)
 {
-    const char *fbreg = strstr(line, "DW_OP_fbreg");
-    if (fbreg == NULL) {
+    const char *p = strstr(line, "DW_OP_fbreg");
+    if (p != NULL) {
+        *base = CDBG_VAR_BASE_FB;
+        p += strlen("DW_OP_fbreg");
+    } else {
+        p = strstr(line, "DW_OP_breg");
+        if (p == NULL) {
+            return -1;
+        }
+        p += strlen("DW_OP_breg");
+        char *end = NULL;
+        long reg = strtol(p, &end, 10);
+        if (end == p) {
+            return -1;
+        }
+        p = end;
+        if (reg == 31) {
+            *base = CDBG_VAR_BASE_SP;
+        } else if (reg == 29) {
+            *base = CDBG_VAR_BASE_X29;
+        } else {
+            return -1;
+        }
+    }
+
+    p = strpbrk(p, "+-0123456789");
+    if (p == NULL) {
         return -1;
     }
 
     char *end = NULL;
-    long long value = strtoll(fbreg + strlen("DW_OP_fbreg"), &end, 10);
-    if (end == fbreg + strlen("DW_OP_fbreg")) {
+    long long value = strtoll(p, &end, 10);
+    if (end == p) {
         return -1;
     }
 
@@ -1858,7 +1753,7 @@ static int find_local_var(cdbg_t *dbg, const char *name, cdbg_var_info_t *out)
             continue;
         }
         if (strstr(line, "DW_AT_location") != NULL &&
-            parse_fbreg_offset(line, &var.fbreg_offset) == 0) {
+            parse_fbreg_offset(line, &var.fbreg_offset, &var.base) == 0) {
             var.has_location = true;
         } else if (strstr(line, "DW_AT_name") != NULL) {
             (void)parse_quoted_value(line, var.name, sizeof(var.name));
@@ -1939,6 +1834,24 @@ static int show_var_push(cdbg_t *dbg, cdbg_show_var_t *vars, size_t *count, size
     vars[*count].addr = addr;
     (*count)++;
     return 0;
+}
+
+static uintptr_t var_base_addr(cdbg_t *dbg, cdbg_var_base_t base)
+{
+    switch (base) {
+    case CDBG_VAR_BASE_SP:
+        {
+            uint64_t sp = 0;
+            if (cdbg_regs_get_by_name(&dbg->regs, "sp", &sp) != 0) {
+                return 0;
+            }
+            return (uintptr_t)sp;
+        }
+    case CDBG_VAR_BASE_X29:
+    case CDBG_VAR_BASE_FB:
+    default:
+        return cdbg_regs_fp(&dbg->regs);
+    }
 }
 
 static bool sym_is_global_data(char type)
@@ -2043,8 +1956,8 @@ static int collect_show_vars(cdbg_t *dbg, cdbg_show_scope_t scope, cdbg_show_var
                     if (scope == CDBG_SHOW_GLOBALS) {
                         addr = cdbg_syms_runtime_addr(&dbg->syms, link_addr);
                     } else {
-                        uintptr_t fp_reg = cdbg_regs_fp(&dbg->regs);
-                        addr = (uintptr_t)((int64_t)fp_reg + var.fbreg_offset);
+                        uintptr_t base = var_base_addr(dbg, var.base);
+                        addr = (uintptr_t)((int64_t)base + var.fbreg_offset);
                     }
                     (void)show_var_push(dbg, vars, count_out, max, &var, addr);
                 }
@@ -2119,7 +2032,7 @@ static int collect_show_vars(cdbg_t *dbg, cdbg_show_scope_t scope, cdbg_show_var
             continue;
         }
         if (strstr(line, "DW_AT_location") != NULL) {
-            if (parse_fbreg_offset(line, &var.fbreg_offset) == 0) {
+            if (parse_fbreg_offset(line, &var.fbreg_offset, &var.base) == 0) {
                 loc_fbreg = true;
             } else if (parse_addr_location(line, &link_addr) == 0) {
                 loc_fbreg = false;
@@ -2150,8 +2063,8 @@ static int collect_show_vars(cdbg_t *dbg, cdbg_show_scope_t scope, cdbg_show_var
             if (scope == CDBG_SHOW_GLOBALS) {
                 addr = cdbg_syms_runtime_addr(&dbg->syms, link_addr);
             } else {
-                uintptr_t fp_reg = cdbg_regs_fp(&dbg->regs);
-                addr = (uintptr_t)((int64_t)fp_reg + var.fbreg_offset);
+                uintptr_t base = var_base_addr(dbg, var.base);
+                addr = (uintptr_t)((int64_t)base + var.fbreg_offset);
             }
             (void)show_var_push(dbg, vars, count_out, max, &var, addr);
         }
@@ -2201,8 +2114,8 @@ static int resolve_variable_address(cdbg_t *dbg, const char *name,
     memset(var, 0, sizeof(*var));
     *found_local = find_local_var(dbg, name, var) == 0;
     if (*found_local) {
-        uintptr_t fp = cdbg_regs_fp(&dbg->regs);
-        *addr = (uintptr_t)((int64_t)fp + var->fbreg_offset);
+        uintptr_t base = var_base_addr(dbg, var->base);
+        *addr = (uintptr_t)((int64_t)base + var->fbreg_offset);
         return 0;
     }
 
@@ -3655,16 +3568,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Inspection",
         "regs, r",
         "regs",
-        "Print all registers: general-purpose, floating-point/NEON, and SSE/x87.",
+        "Print all registers: general-purpose, NEON/FP, and system registers.",
         "ARM64 registers:\n"
         "  General-purpose:  x0-x28, fp (x29), lr (x30), sp, pc, cpsr\n"
-        "  NEON/FP:          v0-v31, fpsr, fpcr\n"
-        "\n"
-        "x86_64 registers:\n"
-        "  General-purpose:  rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,\n"
-        "                    r8-r15, rip, rflags, cs, fs, gs\n"
-        "  SSE:              xmm0-xmm15, mxcsr\n"
-        "  x87 FPU:          st0-st7, fctrl, fstat, ftag\n",
+        "  NEON/FP:          v0-v31, fpsr, fpcr\n",
     },
     {
         "Inspection",
@@ -3836,12 +3743,6 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  set s.field = 100\n"
         "  set p->n = 0\n"
         "\n"
-        "Register examples (x86_64):\n"
-        "  set $rax = 0x10              Integer GPR\n"
-        "  set $xmm0 = 3.14            SSE register (float)\n"
-        "  set $xmm0 = 0x3ff0000000000000  SSE register (bit pattern = 1.0)\n"
-        "  set $st0 = 1.5              x87 FPU register\n"
-        "\n"
         "Register examples (ARM64):\n"
         "  set $x0 = 0xff              Integer GPR\n"
         "  set $v0 = 0x3ff0000000000000  NEON register (lower 64 bits)\n"
@@ -3963,8 +3864,8 @@ static void print_help_all(void)
     puts("  p 3.14               Print float literal");
     puts("  set x = 1            Assign to a variable");
     puts("  set sa[1].b = 100    Assign to an array element member");
-    puts("  set $rax = 0x10      Assign to an integer register");
-    puts("  set $xmm0 = 3.14     Assign float to SSE register");
+    puts("  set $x0 = 0xff       Assign to an integer register");
+    puts("  set $v0 = 0x3ff0000000000000  Assign bit pattern to NEON register");
 }
 
 static int cmd_help(char *args)
