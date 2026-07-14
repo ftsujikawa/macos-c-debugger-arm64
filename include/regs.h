@@ -15,9 +15,14 @@ typedef struct cdbg_regs {
 #define CDBG_THREAD_FLAVOR_COUNT ARM_THREAD_STATE64_COUNT
 #define CDBG_NEON_FLAVOR         ARM_NEON_STATE64
 #define CDBG_NEON_FLAVOR_COUNT   ARM_NEON_STATE64_COUNT
+#define CDBG_DEBUG_FLAVOR        ARM_DEBUG_STATE64
+#define CDBG_DEBUG_FLAVOR_COUNT  ARM_DEBUG_STATE64_COUNT
 
 int  cdbg_regs_get(pid_t pid, cdbg_regs_t *regs);
 int  cdbg_regs_set(pid_t pid, const cdbg_regs_t *regs);
+int  cdbg_regs_get_debug_state(pid_t pid, arm_debug_state64_t *state);
+int  cdbg_regs_set_debug_state(pid_t pid, const arm_debug_state64_t *state);
+int  cdbg_regs_get_exception_state(pid_t pid, uint64_t *far_out, uint32_t *esr_out);
 void cdbg_regs_print(const cdbg_regs_t *regs);
 uintptr_t cdbg_regs_pc(const cdbg_regs_t *regs);
 uintptr_t cdbg_regs_fp(const cdbg_regs_t *regs);

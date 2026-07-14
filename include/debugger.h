@@ -9,6 +9,7 @@
 #include "lineno.h"
 #include "regs.h"
 #include "syms.h"
+#include "watchpoint.h"
 
 #define CDBG_MAX_BREAKPOINTS 64
 #define CDBG_MAX_CMD         256
@@ -43,6 +44,8 @@ typedef struct cdbg {
     cdbg_regs_t regs;
     cdbg_breakpoint_t breakpoints[CDBG_MAX_BREAKPOINTS];
     size_t breakpoint_count;
+    cdbg_watchpoint_t watchpoints[CDBG_MAX_WATCHPOINTS];
+    size_t watchpoint_count;
     cdbg_lineno_t lineno;
     cdbg_syms_t syms;
     char executable_path[CDBG_MAX_PATH];

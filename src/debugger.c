@@ -22,6 +22,7 @@ static int report_stop(cdbg_t *dbg);
 static void report_process_exit(cdbg_t *dbg);
 static void print_stop_header(const cdbg_t *dbg);
 static void print_stop_location(cdbg_t *dbg, uintptr_t pc);
+static bool try_report_watchpoint_hit(cdbg_t *dbg);
 
 static cdbg_t *g_sigint_dbg = NULL;
 
@@ -325,6 +326,9 @@ static int stop_debuggee(cdbg_t *dbg)
     for (size_t i = 0; i < dbg->breakpoint_count; i++) {
         dbg->breakpoints[i].enabled = false;
     }
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        dbg->watchpoints[i].enabled = false;
+    }
     return 0;
 }
 
@@ -348,6 +352,8 @@ int cdbg_run(cdbg_t *dbg, char *const argv[])
 
     dbg->breakpoint_count = 0;
     memset(dbg->breakpoints, 0, sizeof(dbg->breakpoints));
+    dbg->watchpoint_count = 0;
+    memset(dbg->watchpoints, 0, sizeof(dbg->watchpoints));
     memset(&dbg->regs, 0, sizeof(dbg->regs));
     dbg->wait_status = 0;
 
@@ -909,6 +915,9 @@ int cdbg_step_next_line(cdbg_t *dbg)
         if (cdbg_bp_is_trap(pc, dbg->breakpoints, dbg->breakpoint_count)) {
             return report_stop(dbg);
         }
+        if (try_report_watchpoint_hit(dbg)) {
+            return 0;
+        }
 
         char cur_file[CDBG_LINENO_MAX_FILE];
         uint32_t cur_line = 0;
@@ -980,6 +989,9 @@ int cdbg_next_source_line(cdbg_t *dbg)
         pc = cdbg_regs_pc(&dbg->regs);
         if (cdbg_bp_is_trap(pc, dbg->breakpoints, dbg->breakpoint_count)) {
             return report_stop(dbg);
+        }
+        if (try_report_watchpoint_hit(dbg)) {
+            return 0;
         }
 
         char cur_file[CDBG_LINENO_MAX_FILE];
@@ -1085,7 +1097,144 @@ static void report_process_exit(cdbg_t *dbg)
     for (size_t i = 0; i < dbg->breakpoint_count; i++) {
         dbg->breakpoints[i].enabled = false;
     }
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        dbg->watchpoints[i].enabled = false;
+    }
     dbg->pid = 0;
+}
+
+static int find_watchpoint_hit(cdbg_t *dbg, uintptr_t fault_addr, size_t *index_out)
+{
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        if (cdbg_watch_addr_hit(&dbg->watchpoints[i], fault_addr)) {
+            *index_out = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ARM64 watchpoint exceptions leave the PC at the address of the instruction
+ * that triggered them (not the following one), so simply continuing would
+ * retrigger the same watchpoint forever. Disarm every enabled watchpoint,
+ * single-step past the access, then re-arm them all before handing control
+ * back. All slots are disarmed (not just the one that matched) because a
+ * single wide load/store can straddle two adjacent watched granules; leaving
+ * a neighbor armed during the step could retrap on the very same instruction. */
+static int step_past_all_watchpoints(cdbg_t *dbg)
+{
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        if (dbg->watchpoints[i].enabled) {
+            (void)cdbg_watch_disarm(dbg->pid, dbg->watchpoints[i].slot);
+        }
+    }
+
+    if (cdbg_single_step(dbg) != 0) {
+        return -1;
+    }
+    if (cdbg_wait(dbg) != 0) {
+        return dbg->state == CDBG_STATE_IDLE ? 0 : -1;
+    }
+
+    if (dbg->state != CDBG_STATE_STOPPED) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        cdbg_watchpoint_t *wp = &dbg->watchpoints[i];
+        if (wp->enabled) {
+            if (cdbg_watch_arm(dbg->pid, wp->slot, wp->addr, wp->size, wp->kind) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int handle_watchpoint_hit(cdbg_t *dbg, size_t index, bool is_write)
+{
+    cdbg_watchpoint_t *wp = &dbg->watchpoints[index];
+
+    const char *kind_label = "Hardware watchpoint";
+    if (!is_write) {
+        kind_label = wp->kind == CDBG_WATCH_READ ? "Hardware read watchpoint"
+                                                  : "Hardware access (read/write) watchpoint";
+    }
+
+    printf("\n%s %zu: %s\n\n", kind_label, index, wp->expr);
+    if (is_write && wp->has_last_value) {
+        printf("Old value = %llu\n", (unsigned long long)wp->last_value);
+    }
+
+    /* The exception fires before the trapping instruction executes, so a
+     * write's new value only becomes visible after stepping past it. */
+    if (step_past_all_watchpoints(dbg) != 0) {
+        return -1;
+    }
+    if (dbg->state != CDBG_STATE_STOPPED) {
+        report_process_exit(dbg);
+        return 0;
+    }
+
+    uint64_t value = 0;
+    bool have_value = cdbg_mem_read(dbg->pid, wp->addr, &value, wp->size) == 0;
+    if (have_value) {
+        printf(is_write ? "New value = %llu\n" : "Value = %llu\n",
+               (unsigned long long)value);
+        wp->last_value = value;
+        wp->has_last_value = true;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    print_stop_location(dbg, pc);
+    return 0;
+}
+
+/* ESR/FAR classified this stop as a watchpoint exception, but the fault
+ * address didn't fall inside any single registered watchpoint's range. This
+ * happens when a wide load/store (e.g. a paired STP) touches two adjacent
+ * watched granules in one instruction and the CPU reports the transfer's
+ * base address rather than the specific watched byte. Still step past it
+ * (with all watchpoints disarmed) so execution can make progress. */
+static int handle_unresolved_watchpoint_hit(cdbg_t *dbg, uint64_t far)
+{
+    printf("\nHardware watchpoint triggered near 0x%llx (could not attribute "
+           "to a specific watchpoint)\n\n", (unsigned long long)far);
+
+    if (step_past_all_watchpoints(dbg) != 0) {
+        return -1;
+    }
+    if (dbg->state != CDBG_STATE_STOPPED) {
+        report_process_exit(dbg);
+        return 0;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    print_stop_location(dbg, pc);
+    return 0;
+}
+
+static bool try_report_watchpoint_hit(cdbg_t *dbg)
+{
+    if (dbg->watchpoint_count == 0) {
+        return false;
+    }
+
+    uint64_t far = 0;
+    uint32_t esr = 0;
+    bool is_write = false;
+    if (cdbg_regs_get_exception_state(dbg->pid, &far, &esr) != 0 ||
+        !cdbg_watch_is_watchpoint_esr(esr, &is_write)) {
+        return false;
+    }
+
+    size_t index = 0;
+    if (find_watchpoint_hit(dbg, (uintptr_t)far, &index) == 0) {
+        (void)handle_watchpoint_hit(dbg, index, is_write);
+    } else {
+        (void)handle_unresolved_watchpoint_hit(dbg, far);
+    }
+    return true;
 }
 
 static int report_stop(cdbg_t *dbg)
@@ -1103,6 +1252,10 @@ static int report_stop(cdbg_t *dbg)
                 return handle_breakpoint_hit(dbg, i);
             }
         }
+    }
+
+    if (try_report_watchpoint_hit(dbg)) {
+        return 0;
     }
 
     printf("Stopped (pc=0x%lx)\n", (unsigned long)pc);
@@ -3375,16 +3528,47 @@ static int cmd_show_breakpoints(const cdbg_t *dbg)
     return 0;
 }
 
+static const char *watch_kind_label(cdbg_watch_kind_t kind)
+{
+    switch (kind) {
+    case CDBG_WATCH_READ:   return "read";
+    case CDBG_WATCH_WRITE:  return "write";
+    case CDBG_WATCH_ACCESS: return "access";
+    }
+    return "?";
+}
+
+static int cmd_show_watchpoints(const cdbg_t *dbg)
+{
+    if (dbg->watchpoint_count == 0) {
+        puts("No watchpoints.");
+        return 0;
+    }
+
+    printf("%-4s %-4s %-8s %-6s %-18s  %s\n", "Num", "Enb", "Type", "Size",
+           "Address", "Expression");
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        const cdbg_watchpoint_t *wp = &dbg->watchpoints[i];
+        printf("%-4zu %-4s %-8s %-6zu 0x%016lx  %s\n", i,
+               wp->enabled ? "y" : "n", watch_kind_label(wp->kind), wp->size,
+               (unsigned long)wp->addr, wp->expr);
+    }
+    return 0;
+}
+
 static int cmd_show(cdbg_t *dbg, char *args)
 {
     if (args == NULL) {
-        fputs("Usage: show locals|args|globals|bp\n", stderr);
+        fputs("Usage: show locals|args|globals|bp|wp\n", stderr);
         return -1;
     }
 
     args = trim_space(args);
     if (strcmp(args, "bp") == 0) {
         return cmd_show_breakpoints(dbg);
+    }
+    if (strcmp(args, "wp") == 0) {
+        return cmd_show_watchpoints(dbg);
     }
 
     if (dbg->state != CDBG_STATE_STOPPED) {
@@ -3401,7 +3585,7 @@ static int cmd_show(cdbg_t *dbg, char *args)
         scope = CDBG_SHOW_GLOBALS;
     } else {
         fprintf(stderr, "Unknown show option: %s\n", args);
-        fputs("Usage: show locals|args|globals|bp\n", stderr);
+        fputs("Usage: show locals|args|globals|bp|wp\n", stderr);
         return -1;
     }
 
@@ -3599,13 +3783,14 @@ static const cdbg_help_entry_t k_help_entries[] = {
     {
         "Inspection",
         "show",
-        "show locals|args|globals|bp",
-        "Print local variables, arguments, global variables, or breakpoints.",
+        "show locals|args|globals|bp|wp",
+        "Print local variables, arguments, global variables, breakpoints, or watchpoints.",
         "Subcommands:\n"
         "  show locals    Local variables of the current function\n"
         "  show args      Arguments of the current function\n"
         "  show globals   Global variables in the program\n"
-        "  show bp        All breakpoints (same as 'show bp' in Breakpoints)\n",
+        "  show bp        All breakpoints (same as 'show bp' in Breakpoints)\n"
+        "  show wp        All watchpoints (same as 'show wp' in Watchpoints)\n",
     },
     {
         "Inspection",
@@ -3731,6 +3916,63 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  break target.c:42    File and line number\n"
         "  break 42             Line number (single source file)\n"
         "  break 0x100003f20    Absolute address\n",
+    },
+    {
+        "Watchpoints",
+        "watch",
+        "watch <expr>",
+        "Set a hardware watchpoint that stops execution when <expr> is written.",
+        "Uses ARM64 debug registers (up to 4 at a time) to trap on writes\n"
+        "to the watched location without single-stepping.\n"
+        "\n"
+        "Examples:\n"
+        "  watch counter        Stop when the variable is written\n"
+        "  watch arr[0]         Stop when an array element is written\n"
+        "  watch s.field        Stop when a struct member is written\n"
+        "  watch *ptr           Stop when the pointee is written\n"
+        "\n"
+        "Supports scalars up to 8 bytes that do not cross an 8-byte boundary.\n"
+        "Use 'rwatch' for reads and 'awatch' for reads or writes.\n",
+    },
+    {
+        "Watchpoints",
+        "rwatch",
+        "rwatch <expr>",
+        "Set a hardware watchpoint that stops execution when <expr> is read.",
+        "Same expression forms as 'watch', but triggers on reads instead of "
+        "writes.\n",
+    },
+    {
+        "Watchpoints",
+        "awatch",
+        "awatch <expr>",
+        "Set a hardware watchpoint that stops execution on any read or write "
+        "of <expr>.",
+        "Same expression forms as 'watch', but triggers on both reads and "
+        "writes.\n",
+    },
+    {
+        "Watchpoints",
+        "show wp",
+        "show wp",
+        "List watchpoints with number, enabled state, type, size, address, "
+        "and expression.",
+        "Each line shows:\n"
+        "  #n     watchpoint number (used with 'delwatch')\n"
+        "  y/n    enabled\n"
+        "  type   read, write, or access\n"
+        "  size   watched size in bytes\n"
+        "  address and the original expression\n",
+    },
+    {
+        "Watchpoints",
+        "delwatch, dw",
+        "delwatch <n> [n...] | delwatch all",
+        "Delete one or more watchpoints by number.",
+        "Examples:\n"
+        "  delwatch 0        Delete watchpoint #0\n"
+        "  delwatch 0 1      Delete multiple watchpoints\n"
+        "  delwatch all      Delete all watchpoints\n",
     },
     {
         "Settings",
@@ -4292,6 +4534,223 @@ static int cmd_break(cdbg_t *dbg, const char *target)
     return 0;
 }
 
+static int delete_watchpoint_at(cdbg_t *dbg, size_t index)
+{
+    if (index >= dbg->watchpoint_count) {
+        fprintf(stderr, "No watchpoint number %zu\n", index);
+        return -1;
+    }
+
+    cdbg_watchpoint_t *wp = &dbg->watchpoints[index];
+    if (dbg->pid > 0 && dbg->state != CDBG_STATE_IDLE) {
+        if (cdbg_watch_disarm(dbg->pid, wp->slot) != 0) {
+            return -1;
+        }
+    }
+
+    for (size_t i = index + 1; i < dbg->watchpoint_count; i++) {
+        dbg->watchpoints[i - 1] = dbg->watchpoints[i];
+    }
+    dbg->watchpoint_count--;
+    memset(&dbg->watchpoints[dbg->watchpoint_count], 0, sizeof(cdbg_watchpoint_t));
+    return 0;
+}
+
+static int cmd_delwatch(cdbg_t *dbg, char *args)
+{
+    if (dbg->watchpoint_count == 0) {
+        puts("No watchpoints.");
+        return 0;
+    }
+
+    if (args == NULL) {
+        fputs("Usage: delwatch <n> [n...] | delwatch all\n", stderr);
+        return -1;
+    }
+
+    args = trim_space(args);
+    if (args[0] == '\0') {
+        fputs("Usage: delwatch <n> [n...] | delwatch all\n", stderr);
+        return -1;
+    }
+
+    if (strcmp(args, "all") == 0) {
+        while (dbg->watchpoint_count > 0) {
+            if (delete_watchpoint_at(dbg, dbg->watchpoint_count - 1) != 0) {
+                return -1;
+            }
+        }
+        puts("All watchpoints deleted.");
+        return 0;
+    }
+
+    size_t indices[CDBG_MAX_WATCHPOINTS];
+    size_t index_count = 0;
+    char work[CDBG_MAX_CMD];
+    snprintf(work, sizeof(work), "%s", args);
+
+    for (char *token = strtok(work, " \t"); token != NULL;
+         token = strtok(NULL, " \t")) {
+        uint64_t number = 0;
+        if (parse_u64(token, &number) != 0) {
+            fprintf(stderr, "Invalid watchpoint number: %s\n", token);
+            return -1;
+        }
+        if (number >= dbg->watchpoint_count) {
+            fprintf(stderr, "No watchpoint number %llu\n",
+                    (unsigned long long)number);
+            return -1;
+        }
+
+        bool duplicate = false;
+        for (size_t i = 0; i < index_count; i++) {
+            if (indices[i] == (size_t)number) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            indices[index_count++] = (size_t)number;
+        }
+    }
+
+    for (size_t i = 0; i < index_count; i++) {
+        for (size_t j = i + 1; j < index_count; j++) {
+            if (indices[j] > indices[i]) {
+                size_t tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < index_count; i++) {
+        printf("Deleting watchpoint %zu\n", indices[i]);
+        if (delete_watchpoint_at(dbg, indices[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int find_free_watch_slot(const cdbg_t *dbg)
+{
+    bool used[CDBG_MAX_WATCHPOINTS] = {0};
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        const cdbg_watchpoint_t *wp = &dbg->watchpoints[i];
+        if (wp->enabled && wp->slot >= 0 && wp->slot < CDBG_MAX_WATCHPOINTS) {
+            used[wp->slot] = true;
+        }
+    }
+    for (int slot = 0; slot < CDBG_MAX_WATCHPOINTS; slot++) {
+        if (!used[slot]) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+static int cmd_watch(cdbg_t *dbg, char *expr, cdbg_watch_kind_t kind)
+{
+    if (expr == NULL) {
+        fputs("Usage: watch|rwatch|awatch <expr>\n", stderr);
+        return -1;
+    }
+
+    expr = trim_space(expr);
+    if (expr[0] == '\0') {
+        fputs("Usage: watch|rwatch|awatch <expr>\n", stderr);
+        return -1;
+    }
+
+    if (dbg->pid <= 0 || dbg->state != CDBG_STATE_STOPPED) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    if (cdbg_language_check_expr(dbg) != 0) {
+        return -1;
+    }
+
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    if (dbg->watchpoint_count >= CDBG_MAX_WATCHPOINTS) {
+        fputs("Watchpoint table full\n", stderr);
+        return -1;
+    }
+
+    int slot = find_free_watch_slot(dbg);
+    if (slot < 0) {
+        fputs("No hardware watchpoint slots available\n", stderr);
+        return -1;
+    }
+
+    char work_expr[256];
+    snprintf(work_expr, sizeof(work_expr), "%s", expr);
+    uintptr_t addr = 0;
+    size_t size = 0;
+    bool is_signed = false;
+    char value_type[128];
+    bool whole_struct = false;
+    if (resolve_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
+                       sizeof(value_type), &whole_struct) != 0) {
+        fprintf(stderr, "Cannot watch expression: %s\n", expr);
+        return -1;
+    }
+    (void)is_signed;
+
+    if (whole_struct) {
+        fprintf(stderr,
+                "Cannot watch \"%s\": it is a struct/union; watch a specific "
+                "scalar member instead\n",
+                expr);
+        return -1;
+    }
+    if (size == 0 || size > 8) {
+        fprintf(stderr,
+                "Cannot watch \"%s\": value is %zu bytes "
+                "(watchpoints support scalars up to 8 bytes)\n",
+                expr, size);
+        return -1;
+    }
+
+    if (cdbg_watch_arm(dbg->pid, slot, addr, size, kind) != 0) {
+        fprintf(stderr,
+                "Cannot set watchpoint on \"%s\" at 0x%lx: unsupported "
+                "address/size, or no more hardware watchpoints on this CPU\n",
+                expr, (unsigned long)addr);
+        return -1;
+    }
+
+    size_t index = dbg->watchpoint_count;
+    cdbg_watchpoint_t *wp = &dbg->watchpoints[index];
+    memset(wp, 0, sizeof(*wp));
+    wp->addr = addr;
+    wp->size = size;
+    wp->kind = kind;
+    wp->enabled = true;
+    wp->slot = slot;
+    snprintf(wp->expr, sizeof(wp->expr), "%s", expr);
+
+    uint64_t initial_value = 0;
+    if (cdbg_mem_read(dbg->pid, addr, &initial_value, size) == 0) {
+        wp->last_value = initial_value;
+        wp->has_last_value = true;
+    }
+
+    dbg->watchpoint_count++;
+
+    const char *label = kind == CDBG_WATCH_WRITE
+                             ? "Hardware watchpoint"
+                             : kind == CDBG_WATCH_READ
+                                   ? "Hardware read watchpoint"
+                                   : "Hardware access (read/write) watchpoint";
+    printf("%s %zu: %s\n", label, index, expr);
+    return 0;
+}
+
 static void cmd_print_from_repl(cdbg_t *dbg, const char *cmd, char *rest)
 {
     char expr[CDBG_MAX_CMD];
@@ -4451,6 +4910,18 @@ int cdbg_repl(cdbg_t *dbg)
         } else if (strcmp(cmd, "del") == 0 || strcmp(cmd, "delete") == 0) {
             char *args = strtok(NULL, "\n");
             (void)cmd_del(dbg, args);
+        } else if (strcmp(cmd, "watch") == 0) {
+            char *args = strtok(NULL, "\n");
+            (void)cmd_watch(dbg, args, CDBG_WATCH_WRITE);
+        } else if (strcmp(cmd, "rwatch") == 0) {
+            char *args = strtok(NULL, "\n");
+            (void)cmd_watch(dbg, args, CDBG_WATCH_READ);
+        } else if (strcmp(cmd, "awatch") == 0) {
+            char *args = strtok(NULL, "\n");
+            (void)cmd_watch(dbg, args, CDBG_WATCH_ACCESS);
+        } else if (strcmp(cmd, "delwatch") == 0 || strcmp(cmd, "dw") == 0) {
+            char *args = strtok(NULL, "\n");
+            (void)cmd_delwatch(dbg, args);
         } else if (strcmp(cmd, "dis") == 0) {
             char *target = strtok(NULL, "\n");
             (void)cmd_dis(dbg, target);
