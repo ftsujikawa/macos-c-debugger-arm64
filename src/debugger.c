@@ -14,7 +14,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "command_ast.h"
 #include "expr.h"
+#include "expr_shared.h"
 #include "memory.h"
 #include "process.h"
 
@@ -1276,36 +1278,6 @@ static int parse_u64(const char *text, uint64_t *out)
     return 0;
 }
 
-typedef struct cdbg_struct_member {
-    char name[64];
-    char type[64];
-    size_t offset;
-    size_t size;
-    bool is_signed;
-} cdbg_struct_member_t;
-
-typedef enum cdbg_var_base {
-    CDBG_VAR_BASE_FB,
-    CDBG_VAR_BASE_SP,
-    CDBG_VAR_BASE_X29,
-} cdbg_var_base_t;
-
-typedef struct cdbg_var_info {
-    char name[128];
-    char type[128];
-    char element_type[128];
-    int64_t fbreg_offset;
-    cdbg_var_base_t base;
-    size_t size;
-    size_t element_size;
-    size_t pointee_size;
-    size_t array_count;
-    bool has_location;
-    bool is_pointer;
-    bool is_signed;
-    bool is_array;
-} cdbg_var_info_t;
-
 static char *trim_space(char *text)
 {
     while (isspace((unsigned char)*text)) {
@@ -1428,7 +1400,7 @@ static bool pc_in_range(uintptr_t pc, uintptr_t low, uintptr_t high)
     return pc >= low && pc < high;
 }
 
-static size_t type_scalar_size(const char *type)
+size_t type_scalar_size(const char *type)
 {
     if (strchr(type, '*') != NULL) {
         return sizeof(uintptr_t);
@@ -1448,7 +1420,7 @@ static size_t type_scalar_size(const char *type)
     return sizeof(uintptr_t);
 }
 
-static size_t type_pointee_size(const char *type)
+size_t type_pointee_size(const char *type)
 {
     const char *star = strchr(type, '*');
     if (star == NULL) {
@@ -1487,7 +1459,7 @@ static int parse_member_offset(const char *line, size_t *out)
     return 0;
 }
 
-static bool type_is_scalar(const char *type)
+bool type_is_scalar(const char *type)
 {
     if (type == NULL || type[0] == '\0') {
         return false;
@@ -1503,7 +1475,7 @@ static bool type_is_scalar(const char *type)
     return false;
 }
 
-static int parse_array_type(const char *type, char *elem_type, size_t elem_len,
+int parse_array_type(const char *type, char *elem_type, size_t elem_len,
                             size_t *count_out)
 {
     const char *bracket = strchr(type, '[');
@@ -1641,7 +1613,7 @@ static void format_type_for_display(cdbg_t *dbg, const char *type, char *out, si
     }
 }
 
-static int dwarf_lookup_struct(cdbg_t *dbg, const char *name,
+int dwarf_lookup_struct(cdbg_t *dbg, const char *name,
                               cdbg_struct_member_t *members, size_t max_members,
                               size_t *member_count_out, size_t *byte_size_out)
 {
@@ -1762,7 +1734,7 @@ static int dwarf_lookup_struct(cdbg_t *dbg, const char *name,
     return 0;
 }
 
-static size_t type_element_size(cdbg_t *dbg, const char *type)
+size_t type_element_size(cdbg_t *dbg, const char *type)
 {
     if (type == NULL || type[0] == '\0') {
         return 0;
@@ -1783,7 +1755,7 @@ static size_t type_element_size(cdbg_t *dbg, const char *type)
     return sizeof(uintptr_t);
 }
 
-static void complete_var_type(cdbg_t *dbg, cdbg_var_info_t *var)
+void complete_var_type(cdbg_t *dbg, cdbg_var_info_t *var)
 {
     char element_type[128];
     size_t array_count = 0;
@@ -1989,7 +1961,7 @@ static int show_var_push(cdbg_t *dbg, cdbg_show_var_t *vars, size_t *count, size
     return 0;
 }
 
-static uintptr_t var_base_addr(cdbg_t *dbg, cdbg_var_base_t base)
+uintptr_t var_base_addr(cdbg_t *dbg, cdbg_var_base_t base)
 {
     switch (base) {
     case CDBG_VAR_BASE_SP:
@@ -2232,7 +2204,7 @@ static int collect_show_vars(cdbg_t *dbg, cdbg_show_scope_t scope, cdbg_show_var
     return *count_out > 0 ? 0 : -1;
 }
 
-static int read_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t *out)
+int read_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t *out)
 {
     if (size == 0 || size > sizeof(uint64_t)) {
         size = sizeof(uint64_t);
@@ -2249,7 +2221,7 @@ static int read_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t *o
     return 0;
 }
 
-static int write_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t value)
+int write_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t value)
 {
     if (size == 0 || size > sizeof(uint64_t)) {
         size = sizeof(uint64_t);
@@ -2260,7 +2232,7 @@ static int write_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t v
     return cdbg_mem_write(pid, addr, buf, size);
 }
 
-static int resolve_variable_address(cdbg_t *dbg, const char *name,
+int resolve_variable_address(cdbg_t *dbg, const char *name,
                                     cdbg_var_info_t *var, uintptr_t *addr,
                                     bool *found_local)
 {
@@ -2578,40 +2550,7 @@ static int print_struct_element(cdbg_t *dbg, uintptr_t addr,
     return 0;
 }
 
-static bool parse_array_index_expr(const char *expr, char *name, size_t name_len,
-                                   size_t *index_out)
-{
-    const char *bracket = strchr(expr, '[');
-    if (bracket == NULL || bracket == expr) {
-        return false;
-    }
-
-    size_t nlen = (size_t)(bracket - expr);
-    if (nlen >= name_len) {
-        return false;
-    }
-    memcpy(name, expr, nlen);
-    name[nlen] = '\0';
-    if (!is_simple_identifier(name)) {
-        return false;
-    }
-
-    const char *p = bracket + 1;
-    if (*p == '\0' || !isdigit((unsigned char)*p)) {
-        return false;
-    }
-
-    char *end = NULL;
-    unsigned long idx = strtoul(p, &end, 10);
-    if (end == p || *end != ']' || end[1] != '\0') {
-        return false;
-    }
-
-    *index_out = (size_t)idx;
-    return true;
-}
-
-static void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t out_len)
+void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t out_len)
 {
     const char *star = strchr(var->type, '*');
     if (star == NULL) {
@@ -2630,7 +2569,7 @@ static void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t o
     out[len] = '\0';
 }
 
-static int resolve_subscript_element(cdbg_t *dbg, const char *var_name, size_t index,
+int resolve_subscript_element(cdbg_t *dbg, const char *var_name, size_t index,
                                      cdbg_var_info_t *elem_view, uintptr_t *elem_addr)
 {
     cdbg_var_info_t var = {0};
@@ -2775,18 +2714,6 @@ static int print_named_variable(cdbg_t *dbg, const cdbg_var_info_t *var, uintptr
     return 0;
 }
 
-static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
-                                const char *member_name, size_t *offset_out,
-                                size_t *size_out, bool *signed_out,
-                                char *type_out, size_t type_out_len);
-
-static int split_access_path(char *expr, char **base_out, char **member_out,
-                             bool *via_pointer);
-
-static int resolve_lvalue(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                          size_t *size_out, bool *signed_out, char *value_type,
-                          size_t value_type_len, bool *whole_struct_out);
-
 static int cmd_print(cdbg_t *dbg, char *expr)
 {
     if (expr == NULL) {
@@ -2858,8 +2785,8 @@ static int cmd_print(cdbg_t *dbg, char *expr)
     bool is_signed = false;
     char value_type[128];
     bool whole_struct = false;
-    if (resolve_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
-                       sizeof(value_type), &whole_struct) == 0) {
+    if (cdbg_expr_eval_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
+                              sizeof(value_type), &whole_struct) == 0) {
         if (whole_struct && fmt == PRINT_FMT_DEFAULT) {
             cdbg_struct_member_t members[32];
             size_t member_count = 0;
@@ -2898,10 +2825,10 @@ static int cmd_print(cdbg_t *dbg, char *expr)
     return 0;
 }
 
-static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
-                                const char *member_name, size_t *offset_out,
-                                size_t *size_out, bool *signed_out,
-                                char *type_out, size_t type_out_len)
+int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
+                         const char *member_name, size_t *offset_out,
+                         size_t *size_out, bool *signed_out,
+                         char *type_out, size_t type_out_len)
 {
     cdbg_struct_member_t members[32];
     size_t member_count = 0;
@@ -2925,186 +2852,6 @@ static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
     return -1;
 }
 
-static int split_access_path(char *expr, char **base_out, char **member_out,
-                             bool *via_pointer)
-{
-    char *arrow = strstr(expr, "->");
-    if (arrow != NULL) {
-        *arrow = '\0';
-        *base_out = trim_space(expr);
-        *member_out = trim_space(arrow + 2);
-        *via_pointer = true;
-        if ((*member_out)[0] == '\0' || !is_simple_identifier(*member_out)) {
-            return -1;
-        }
-        return 0;
-    }
-
-    char *dot = strchr(expr, '.');
-    if (dot != NULL) {
-        *dot = '\0';
-        *base_out = trim_space(expr);
-        *member_out = trim_space(dot + 1);
-        *via_pointer = false;
-        if ((*member_out)[0] == '\0' || !is_simple_identifier(*member_out)) {
-            return -1;
-        }
-        return 0;
-    }
-
-    *base_out = trim_space(expr);
-    *member_out = NULL;
-    *via_pointer = false;
-    return 0;
-}
-
-static int resolve_lvalue(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                          size_t *size_out, bool *signed_out, char *value_type,
-                          size_t value_type_len, bool *whole_struct_out)
-{
-    *whole_struct_out = false;
-
-    char *base = NULL;
-    char *member = NULL;
-    bool via_ptr = false;
-    if (split_access_path(expr, &base, &member, &via_ptr) != 0) {
-        return -1;
-    }
-
-    char type_buf[128] = {0};
-    uintptr_t addr = 0;
-    size_t value_size = 0;
-    bool value_signed = false;
-
-    if (base[0] == '*') {
-        const char *inner = trim_space(base + 1);
-        if (inner[0] == '\0') {
-            return -1;
-        }
-
-        uint64_t parsed = 0;
-        if (parse_u64(inner, &parsed) == 0) {
-            addr = (uintptr_t)parsed;
-            value_size = sizeof(uint64_t);
-        } else {
-            cdbg_var_info_t var = {0};
-            uintptr_t var_addr = 0;
-            bool found = false;
-            if (resolve_variable_address(dbg, inner, &var, &var_addr, &found) != 0) {
-                fprintf(stderr, "Unknown variable: %s\n", inner);
-                return -1;
-            }
-            if (!var.is_pointer) {
-                fprintf(stderr, "%s is not a pointer\n", inner);
-                return -1;
-            }
-            uint64_t ptr = 0;
-            if (read_scalar_value(dbg->pid, var_addr, sizeof(uintptr_t), &ptr) != 0) {
-                return -1;
-            }
-            addr = (uintptr_t)ptr;
-            pointer_pointee_type(&var, type_buf, sizeof(type_buf));
-            value_size = type_element_size(dbg, type_buf);
-        }
-    } else {
-        char arr_name[128];
-        size_t arr_index = 0;
-        if (parse_array_index_expr(base, arr_name, sizeof(arr_name), &arr_index)) {
-            cdbg_var_info_t elem_var = {0};
-            if (resolve_subscript_element(dbg, arr_name, arr_index, &elem_var, &addr) != 0) {
-                return -1;
-            }
-            snprintf(type_buf, sizeof(type_buf), "%s", elem_var.element_type);
-            value_size = elem_var.element_size;
-        } else if (is_simple_identifier(base)) {
-            cdbg_var_info_t var = {0};
-            uintptr_t var_addr = 0;
-            bool found = false;
-            if (resolve_variable_address(dbg, base, &var, &var_addr, &found) != 0) {
-                fprintf(stderr, "Unknown variable: %s\n", base);
-                return -1;
-            }
-            if (var.is_array && member == NULL) {
-                return -1;
-            }
-            if (via_ptr) {
-                if (!var.is_pointer) {
-                    fprintf(stderr, "%s is not a pointer\n", base);
-                    return -1;
-                }
-                uint64_t ptr = 0;
-                if (read_scalar_value(dbg->pid, var_addr, sizeof(uintptr_t), &ptr) != 0) {
-                    return -1;
-                }
-                addr = (uintptr_t)ptr;
-                pointer_pointee_type(&var, type_buf, sizeof(type_buf));
-                value_size = type_element_size(dbg, type_buf);
-            } else {
-                addr = var_addr;
-                snprintf(type_buf, sizeof(type_buf), "%s", var.type);
-                value_size = var.size;
-                value_signed = var.is_signed;
-            }
-        } else {
-            return -1;
-        }
-    }
-
-    if (member != NULL) {
-        size_t offset = 0;
-        size_t member_size = 0;
-        bool member_signed = false;
-        char member_type[64] = {0};
-        if (lookup_struct_member(dbg, type_buf, member, &offset, &member_size,
-                                 &member_signed, member_type, sizeof(member_type)) != 0) {
-            fprintf(stderr, "Unknown member: %s\n", member);
-            return -1;
-        }
-        *addr_out = addr + offset;
-        *size_out = member_size;
-        *signed_out = member_signed;
-        snprintf(value_type, value_type_len, "%s",
-                 member_type[0] != '\0' ? member_type : type_buf);
-        return 0;
-    }
-
-    *addr_out = addr;
-    *size_out = value_size;
-    if (type_buf[0] != '\0') {
-        value_signed = strstr(type_buf, "unsigned") == NULL;
-    }
-    *signed_out = value_signed;
-    snprintf(value_type, value_type_len, "%s", type_buf);
-    if (type_buf[0] != '\0' && !type_is_scalar(type_buf)) {
-        *whole_struct_out = true;
-    }
-    return 0;
-}
-
-int cdbg_resolve_lvalue_expr(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                             char *type_out, size_t type_out_len)
-{
-    if (dbg == NULL || expr == NULL || addr_out == NULL) {
-        return -1;
-    }
-
-    size_t size = 0;
-    bool is_signed = false;
-    bool whole_struct = false;
-    char type_buf[128] = {0};
-    if (resolve_lvalue(dbg, expr, addr_out, &size, &is_signed, type_buf, sizeof(type_buf),
-                       &whole_struct) != 0) {
-        return -1;
-    }
-
-    if (type_out != NULL && type_out_len > 0) {
-        snprintf(type_out, type_out_len, "%s", type_buf);
-    }
-    (void)is_signed;
-    (void)whole_struct;
-    return 0;
-}
-
 static int resolve_set_lhs(cdbg_t *dbg, char *lhs, uintptr_t *addr_out,
                            size_t *size_out, bool *signed_out)
 {
@@ -3119,8 +2866,8 @@ static int resolve_set_lhs(cdbg_t *dbg, char *lhs, uintptr_t *addr_out,
 
     char value_type[128];
     bool whole_struct = false;
-    if (resolve_lvalue(dbg, lhs, addr_out, size_out, signed_out, value_type,
-                       sizeof(value_type), &whole_struct) != 0) {
+    if (cdbg_expr_eval_lvalue(dbg, lhs, addr_out, size_out, signed_out, value_type,
+                             sizeof(value_type), &whole_struct) != 0) {
         return -1;
     }
     if (whole_struct) {
@@ -3775,6 +3522,8 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  p/x ptr          Pointer in hex\n"
         "  p sa             Array\n"
         "  p f.a, p p->b    Struct members\n"
+        "  p p->a.b         Nested member access (any depth)\n"
+        "  p arr[i]         Array index (any expression, not just a literal)\n"
         "  p 3.14           Float literal\n"
         "  p x + y * 2      Arithmetic\n"
         "  p *ptr           Dereference\n"
@@ -3982,8 +3731,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Variable examples:\n"
         "  set x = 42\n"
         "  set arr[0] = 1\n"
+        "  set arr[i] = 1              Index can be any expression\n"
         "  set s.field = 100\n"
         "  set p->n = 0\n"
+        "  set p->inner.field = 0       Nested member access (any depth)\n"
         "\n"
         "Register examples (ARM64):\n"
         "  set $x0 = 0xff              Integer GPR\n"
@@ -4103,6 +3854,7 @@ static void print_help_all(void)
     puts("  p/x ptr              Print pointer in hex");
     puts("  p sa                 Print an array");
     puts("  p f.a, p p->b        Print struct members");
+    puts("  p arr[i]             Print an array element (index can be any expression)");
     puts("  p 3.14               Print float literal");
     puts("  set x = 1            Assign to a variable");
     puts("  set sa[1].b = 100    Assign to an array element member");
@@ -4694,8 +4446,8 @@ static int cmd_watch(cdbg_t *dbg, char *expr, cdbg_watch_kind_t kind)
     bool is_signed = false;
     char value_type[128];
     bool whole_struct = false;
-    if (resolve_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
-                       sizeof(value_type), &whole_struct) != 0) {
+    if (cdbg_expr_eval_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
+                              sizeof(value_type), &whole_struct) != 0) {
         fprintf(stderr, "Cannot watch expression: %s\n", expr);
         return -1;
     }
@@ -4751,22 +4503,15 @@ static int cmd_watch(cdbg_t *dbg, char *expr, cdbg_watch_kind_t kind)
     return 0;
 }
 
-static void cmd_print_from_repl(cdbg_t *dbg, const char *cmd, char *rest)
+static void cmd_print_from_repl(cdbg_t *dbg, char fmt_char, const char *rest)
 {
     char expr[CDBG_MAX_CMD];
-    const char *fmt = NULL;
 
-    if (strncmp(cmd, "p/", 2) == 0) {
-        fmt = cmd + 2;
-    } else if (strncmp(cmd, "print/", 6) == 0) {
-        fmt = cmd + 6;
-    }
-
-    if (fmt != NULL) {
+    if (fmt_char != '\0') {
         if (rest != NULL && rest[0] != '\0') {
-            snprintf(expr, sizeof(expr), "/%s %s", fmt, rest);
+            snprintf(expr, sizeof(expr), "/%c %s", fmt_char, rest);
         } else {
-            snprintf(expr, sizeof(expr), "/%s", fmt);
+            snprintf(expr, sizeof(expr), "/%c", fmt_char);
         }
     } else if (rest != NULL) {
         snprintf(expr, sizeof(expr), "%s", rest);
@@ -4802,34 +4547,37 @@ int cdbg_repl(cdbg_t *dbg)
             *newline = '\0';
         }
 
-        char *cmd = strtok(line, " \t");
-        if (cmd == NULL || cmd[0] == '\0') {
-            continue;
-        }
+        cdbg_command_t cmd = {0};
+        (void)cdbg_command_parse(line, &cmd);
 
-        if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_help(args);
-        } else if (strcmp(cmd, "run") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_run(dbg, args);
-        } else if (strcmp(cmd, "continue") == 0 || strcmp(cmd, "c") == 0) {
+        switch (cmd.kind) {
+        case CDBG_CMD_EMPTY:
+            break;
+        case CDBG_CMD_HELP:
+            (void)cmd_help(cmd.arg1);
+            break;
+        case CDBG_CMD_RUN:
+            (void)cmd_run(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_CONTINUE:
             if (dbg->state == CDBG_STATE_IDLE) {
                 fputs("No process is running\n", stderr);
-                continue;
+                break;
             }
             if (cdbg_continue(dbg) != 0) {
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (dbg->state == CDBG_STATE_IDLE) {
                 report_process_exit(dbg);
-                continue;
+                break;
             }
             if (cdbg_wait(dbg) != 0) {
                 if (dbg->state == CDBG_STATE_IDLE) {
                     report_process_exit(dbg);
-                    continue;
+                    break;
                 }
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (dbg->state == CDBG_STATE_STOPPED) {
@@ -4837,30 +4585,35 @@ int cdbg_repl(cdbg_t *dbg)
             } else if (dbg->state == CDBG_STATE_IDLE) {
                 report_process_exit(dbg);
             }
-        } else if (strcmp(cmd, "step") == 0 || strcmp(cmd, "s") == 0) {
+            break;
+        case CDBG_CMD_STEP:
             if (dbg->state == CDBG_STATE_IDLE) {
                 fputs("No process is running\n", stderr);
-                continue;
+                break;
             }
             if (cdbg_step_next_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (dbg->state == CDBG_STATE_IDLE) {
                 report_process_exit(dbg);
             }
-        } else if (strcmp(cmd, "si") == 0) {
+            break;
+        case CDBG_CMD_SI:
             if (dbg->state == CDBG_STATE_IDLE) {
                 fputs("No process is running\n", stderr);
-                continue;
+                break;
             }
             if (cdbg_single_step(dbg) != 0) {
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (cdbg_wait(dbg) != 0) {
                 if (dbg->state == CDBG_STATE_IDLE) {
                     report_process_exit(dbg);
-                    continue;
+                    break;
                 }
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (dbg->state == CDBG_STATE_STOPPED) {
@@ -4868,84 +4621,84 @@ int cdbg_repl(cdbg_t *dbg)
             } else if (dbg->state == CDBG_STATE_IDLE) {
                 report_process_exit(dbg);
             }
-        } else if (strcmp(cmd, "next") == 0 || strcmp(cmd, "n") == 0) {
+            break;
+        case CDBG_CMD_NEXT:
             if (dbg->state == CDBG_STATE_IDLE) {
                 fputs("No process is running\n", stderr);
-                continue;
+                break;
             }
             if (cdbg_next_source_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+                cdbg_command_free(&cmd);
                 return -1;
             }
             if (dbg->state == CDBG_STATE_IDLE) {
                 report_process_exit(dbg);
             }
-        } else if (strcmp(cmd, "up") == 0) {
+            break;
+        case CDBG_CMD_UP:
             (void)cdbg_frame_up(dbg);
-        } else if (strcmp(cmd, "regs") == 0 || strcmp(cmd, "r") == 0) {
+            break;
+        case CDBG_CMD_REGS:
             if (cdbg_refresh_regs(dbg) != 0) {
+                cdbg_command_free(&cmd);
                 return -1;
             }
             cdbg_print_regs(dbg);
-        } else if (strcmp(cmd, "print") == 0 || strcmp(cmd, "p") == 0 ||
-                   strncmp(cmd, "p/", 2) == 0 || strncmp(cmd, "print/", 6) == 0) {
-            char *rest = strtok(NULL, "\n");
-            cmd_print_from_repl(dbg, cmd, rest);
-        } else if (strcmp(cmd, "set") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_set(dbg, args);
-        } else if (strcmp(cmd, "show") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_show(dbg, args);
-        } else if (strcmp(cmd, "tb") == 0) {
+            break;
+        case CDBG_CMD_PRINT:
+            cmd_print_from_repl(dbg, cmd.print_fmt, cmd.arg1);
+            break;
+        case CDBG_CMD_SET:
+            (void)cmd_set(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_SHOW:
+            (void)cmd_show(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_TB:
             (void)cmd_backtrace(dbg);
-        } else if (strcmp(cmd, "leaks") == 0) {
+            break;
+        case CDBG_CMD_LEAKS:
             (void)cmd_leaks(dbg);
-        } else if (strcmp(cmd, "break") == 0 || strcmp(cmd, "b") == 0) {
-            char *addr_text = strtok(NULL, " \t");
-            if (addr_text == NULL) {
+            break;
+        case CDBG_CMD_BREAK:
+            if (cmd.arg1 == NULL) {
                 fputs("Usage: break <addr|name|file:line|line>\n", stderr);
             } else {
-                (void)cmd_break(dbg, addr_text);
+                (void)cmd_break(dbg, cmd.arg1);
             }
-        } else if (strcmp(cmd, "del") == 0 || strcmp(cmd, "delete") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_del(dbg, args);
-        } else if (strcmp(cmd, "watch") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_watch(dbg, args, CDBG_WATCH_WRITE);
-        } else if (strcmp(cmd, "rwatch") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_watch(dbg, args, CDBG_WATCH_READ);
-        } else if (strcmp(cmd, "awatch") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_watch(dbg, args, CDBG_WATCH_ACCESS);
-        } else if (strcmp(cmd, "delwatch") == 0 || strcmp(cmd, "dw") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_delwatch(dbg, args);
-        } else if (strcmp(cmd, "dis") == 0) {
-            char *target = strtok(NULL, "\n");
-            (void)cmd_dis(dbg, target);
-        } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "l") == 0) {
-            char *target = strtok(NULL, "\n");
-            (void)cmd_list(dbg, target);
-        } else if (strcmp(cmd, "lines") == 0) {
-            char *file_filter = strtok(NULL, " \t");
-            (void)cmd_lines(dbg, file_filter);
-        } else if (strcmp(cmd, "lists") == 0) {
-            char *file_filter = strtok(NULL, " \t");
-            cdbg_lineno_print_list(&dbg->lineno, file_filter);
-        } else if (strcmp(cmd, "syms") == 0 || strcmp(cmd, "sym") == 0) {
-            char *name_filter = strtok(NULL, " \t");
-            cdbg_syms_print_list(&dbg->syms, name_filter);
-        } else if (strcmp(cmd, "x") == 0) {
-            char *addr_text = strtok(NULL, " \t");
-            char *count_text = strtok(NULL, " \t");
-            if (addr_text == NULL) {
+            break;
+        case CDBG_CMD_DEL:
+            (void)cmd_del(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_WATCH:
+            (void)cmd_watch(dbg, cmd.arg1, cmd.watch_kind);
+            break;
+        case CDBG_CMD_DELWATCH:
+            (void)cmd_delwatch(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_DIS:
+            (void)cmd_dis(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_LIST:
+            (void)cmd_list(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_LINES:
+            (void)cmd_lines(dbg, cmd.arg1);
+            break;
+        case CDBG_CMD_LISTS:
+            cdbg_lineno_print_list(&dbg->lineno, cmd.arg1);
+            break;
+        case CDBG_CMD_SYMS:
+            cdbg_syms_print_list(&dbg->syms, cmd.arg1);
+            break;
+        case CDBG_CMD_X:
+            if (cmd.arg1 == NULL) {
                 fputs("Usage: x <addr> [count]\n", stderr);
             } else {
-                (void)cmd_examine(dbg, addr_text, count_text);
+                (void)cmd_examine(dbg, cmd.arg1, cmd.arg2);
             }
-        } else if (strcmp(cmd, "kill") == 0) {
+            break;
+        case CDBG_CMD_KILL:
             if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
                 fputs("No process is running.\n", stderr);
             } else {
@@ -4953,14 +4706,20 @@ int cdbg_repl(cdbg_t *dbg)
                 (void)stop_debuggee(dbg);
                 printf("Process %d killed.\n", killed_pid);
             }
-        } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) {
+            break;
+        case CDBG_CMD_QUIT:
             (void)stop_debuggee(dbg);
             cdbg_lineno_free(&dbg->lineno);
             cdbg_syms_free(&dbg->syms);
+            cdbg_command_free(&cmd);
             return 0;
-        } else {
-            printf("Unknown command: %s\n", cmd);
+        case CDBG_CMD_UNKNOWN:
+        default:
+            printf("Unknown command: %s\n", cmd.unknown_text);
+            break;
         }
+
+        cdbg_command_free(&cmd);
     }
 
     return 0;

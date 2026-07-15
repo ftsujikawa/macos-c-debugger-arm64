@@ -17,4 +17,12 @@ typedef struct cdbg_expr_result {
 
 int cdbg_expr_eval(cdbg_t *dbg, const char *text, cdbg_expr_result_t *out);
 
+/* Resolves `text` to an lvalue: an address, size, signedness, and type
+ * string. Used by print/set/watch to locate their target (a variable,
+ * struct member, array element, or dereferenced pointer). Fails if `text`
+ * does not denote a storage location (e.g. a literal or `&expr`). */
+int cdbg_expr_eval_lvalue(cdbg_t *dbg, const char *text, uintptr_t *addr_out,
+                         size_t *size_out, bool *signed_out, char *type_out,
+                         size_t type_out_len, bool *whole_struct_out);
+
 #endif /* CDBG_EXPR_H */
