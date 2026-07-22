@@ -6,51 +6,12 @@
 #include <string.h>
 
 #include "memory.h"
+#include "threads.h"
 
-static mach_port_t task_for_traced_pid(pid_t pid)
+int cdbg_regs_get(pid_t pid, uint64_t tid, cdbg_regs_t *regs)
 {
-    mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "task_for_pid failed: %s (%d)\n", mach_error_string(kr), kr);
-        return MACH_PORT_NULL;
-    }
-
-    return task;
-}
-
-static thread_act_t primary_thread_for_task(mach_port_t task)
-{
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t count = 0;
-    kern_return_t kr = task_threads(task, &threads, &count);
-
-    if (kr != KERN_SUCCESS || count == 0) {
-        fprintf(stderr, "task_threads failed: %s (%d)\n", mach_error_string(kr), kr);
-        return MACH_PORT_NULL;
-    }
-
-    thread_act_t primary = threads[0];
-    for (mach_msg_type_number_t i = 1; i < count; i++) {
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                  count * sizeof(thread_act_t));
-
-    return primary;
-}
-
-int cdbg_regs_get(pid_t pid, cdbg_regs_t *regs)
-{
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) {
-        return -1;
-    }
-
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) {
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
         return -1;
     }
 
@@ -76,16 +37,10 @@ int cdbg_regs_get(pid_t pid, cdbg_regs_t *regs)
     return 0;
 }
 
-int cdbg_regs_set(pid_t pid, const cdbg_regs_t *regs)
+int cdbg_regs_set(pid_t pid, uint64_t tid, const cdbg_regs_t *regs)
 {
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) {
-        return -1;
-    }
-
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) {
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
         return -1;
     }
 
@@ -102,16 +57,10 @@ int cdbg_regs_set(pid_t pid, const cdbg_regs_t *regs)
     return 0;
 }
 
-int cdbg_regs_get_debug_state(pid_t pid, arm_debug_state64_t *state)
+int cdbg_regs_get_debug_state(pid_t pid, uint64_t tid, arm_debug_state64_t *state)
 {
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) {
-        return -1;
-    }
-
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) {
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
         return -1;
     }
 
@@ -127,16 +76,10 @@ int cdbg_regs_get_debug_state(pid_t pid, arm_debug_state64_t *state)
     return 0;
 }
 
-int cdbg_regs_set_debug_state(pid_t pid, const arm_debug_state64_t *state)
+int cdbg_regs_set_debug_state(pid_t pid, uint64_t tid, const arm_debug_state64_t *state)
 {
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) {
-        return -1;
-    }
-
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) {
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
         return -1;
     }
 
@@ -152,16 +95,11 @@ int cdbg_regs_set_debug_state(pid_t pid, const arm_debug_state64_t *state)
     return 0;
 }
 
-int cdbg_regs_get_exception_state(pid_t pid, uint64_t *far_out, uint32_t *esr_out)
+int cdbg_regs_get_exception_state(pid_t pid, uint64_t tid, uint64_t *far_out,
+                                  uint32_t *esr_out)
 {
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) {
-        return -1;
-    }
-
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) {
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
         return -1;
     }
 
@@ -275,13 +213,12 @@ void cdbg_regs_print(const cdbg_regs_t *regs)
     }
 }
 
-static int cdbg_regs_set_fp(pid_t pid, const cdbg_regs_t *regs)
+static int cdbg_regs_set_fp(pid_t pid, uint64_t tid, const cdbg_regs_t *regs)
 {
-    mach_port_t task = task_for_traced_pid(pid);
-    if (task == MACH_PORT_NULL) return -1;
-    thread_act_t thread = primary_thread_for_task(task);
-    mach_port_deallocate(mach_task_self(), task);
-    if (thread == MACH_PORT_NULL) return -1;
+    thread_act_t thread = MACH_PORT_NULL;
+    if (cdbg_threads_resolve_port(pid, tid, &thread) != 0) {
+        return -1;
+    }
 
     kern_return_t kr = thread_set_state(thread, CDBG_NEON_FLAVOR,
                                         (thread_state_t)&regs->neon,
@@ -362,14 +299,14 @@ int cdbg_regs_get_by_name(const cdbg_regs_t *regs, const char *name, uint64_t *o
     return -1;
 }
 
-int cdbg_regs_set_by_name(pid_t pid, cdbg_regs_t *regs, const char *name,
+int cdbg_regs_set_by_name(pid_t pid, uint64_t tid, cdbg_regs_t *regs, const char *name,
                            uint64_t value, bool is_float, double fvalue)
 {
     if (set_gpr_field(regs, name, value) == 0) {
-        return cdbg_regs_set(pid, regs);
+        return cdbg_regs_set(pid, tid, regs);
     }
     if (set_fp_field(regs, name, value, is_float, fvalue) == 0) {
-        return cdbg_regs_set_fp(pid, regs);
+        return cdbg_regs_set_fp(pid, tid, regs);
     }
     return -1;
 }

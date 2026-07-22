@@ -68,7 +68,8 @@
      KW_X = 284,
      KW_KILL = 285,
      KW_QUIT = 286,
-     KW_PRINT_FMT = 287
+     KW_THREAD = 287,
+     KW_PRINT_FMT = 288
    };
 #endif
 /* Tokens.  */
@@ -101,7 +102,8 @@
 #define KW_X 284
 #define KW_KILL 285
 #define KW_QUIT 286
-#define KW_PRINT_FMT 287
+#define KW_THREAD 287
+#define KW_PRINT_FMT 288
 
 
 
@@ -113,7 +115,7 @@ typedef union YYSTYPE
     char *text;
 }
 /* Line 1529 of yacc.c.  */
-#line 117 "build/command.tab.h"
+#line 119 "build/command.tab.h"
 	YYSTYPE;
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */
 # define YYSTYPE_IS_DECLARED 1

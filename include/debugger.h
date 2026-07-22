@@ -9,6 +9,7 @@
 #include "lineno.h"
 #include "regs.h"
 #include "syms.h"
+#include "threads.h"
 #include "watchpoint.h"
 
 #define CDBG_MAX_BREAKPOINTS 64
@@ -41,6 +42,7 @@ typedef struct cdbg {
     pid_t pid;
     cdbg_state_t state;
     int wait_status;
+    uint64_t current_tid; /* 0 = unselected, meaning "the primary thread" */
     cdbg_regs_t regs;
     cdbg_breakpoint_t breakpoints[CDBG_MAX_BREAKPOINTS];
     size_t breakpoint_count;

@@ -16,7 +16,7 @@
 #define ESR_EC_WATCHPOINT_SAME_EL  0x35u
 #define ESR_WNR_BIT               (1u << 6)
 
-int cdbg_watch_arm(pid_t pid, int slot, uintptr_t addr, size_t size,
+int cdbg_watch_arm(pid_t pid, uint64_t tid, int slot, uintptr_t addr, size_t size,
                    cdbg_watch_kind_t kind)
 {
     if (slot < 0 || slot >= CDBG_MAX_WATCHPOINTS) {
@@ -33,7 +33,7 @@ int cdbg_watch_arm(pid_t pid, int slot, uintptr_t addr, size_t size,
     }
 
     arm_debug_state64_t state;
-    if (cdbg_regs_get_debug_state(pid, &state) != 0) {
+    if (cdbg_regs_get_debug_state(pid, tid, &state) != 0) {
         return -1;
     }
 
@@ -49,33 +49,33 @@ int cdbg_watch_arm(pid_t pid, int slot, uintptr_t addr, size_t size,
     state.__wvr[slot] = (uint64_t)(addr & ~0x7ULL);
     state.__wcr[slot] = wcr;
 
-    if (cdbg_regs_set_debug_state(pid, &state) != 0) {
+    if (cdbg_regs_set_debug_state(pid, tid, &state) != 0) {
         return -1;
     }
 
     /* Some hardware implements fewer than CDBG_MAX_WATCHPOINTS slots; a
      * read-back mismatch means this slot doesn't really exist. */
     arm_debug_state64_t verify;
-    if (cdbg_regs_get_debug_state(pid, &verify) != 0 || verify.__wcr[slot] != wcr) {
+    if (cdbg_regs_get_debug_state(pid, tid, &verify) != 0 || verify.__wcr[slot] != wcr) {
         return -1;
     }
 
     return 0;
 }
 
-int cdbg_watch_disarm(pid_t pid, int slot)
+int cdbg_watch_disarm(pid_t pid, uint64_t tid, int slot)
 {
     if (slot < 0 || slot >= CDBG_MAX_WATCHPOINTS) {
         return -1;
     }
 
     arm_debug_state64_t state;
-    if (cdbg_regs_get_debug_state(pid, &state) != 0) {
+    if (cdbg_regs_get_debug_state(pid, tid, &state) != 0) {
         return -1;
     }
 
     state.__wcr[slot] &= ~(uint64_t)WCR_ENABLE;
-    return cdbg_regs_set_debug_state(pid, &state);
+    return cdbg_regs_set_debug_state(pid, tid, &state);
 }
 
 bool cdbg_watch_addr_hit(const cdbg_watchpoint_t *wp, uintptr_t fault_addr)

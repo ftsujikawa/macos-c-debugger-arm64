@@ -31,6 +31,7 @@ typedef enum {
     CDBG_CMD_X,
     CDBG_CMD_KILL,
     CDBG_CMD_QUIT,
+    CDBG_CMD_THREAD,
 } cdbg_cmd_kind_t;
 
 typedef struct {

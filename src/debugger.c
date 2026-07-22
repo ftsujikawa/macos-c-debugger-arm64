@@ -292,7 +292,7 @@ static int run_to_entry_stop(cdbg_t *dbg)
         (void)cdbg_bp_disable(&temp_bp, dbg->pid);
         if (entry_addr > 0) {
             (void)cdbg_regs_set_pc(&dbg->regs, entry_addr);
-            if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+            if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
                 return -1;
             }
         }
@@ -314,8 +314,20 @@ static int stop_debuggee(cdbg_t *dbg)
     }
 
     if (dbg->state != CDBG_STATE_IDLE) {
-        if (ptrace(PT_KILL, dbg->pid, (caddr_t)0, 0) == -1) {
-            perror("ptrace(PT_KILL)");
+        /* With more than one thread alive, sending SIGKILL (or PT_KILL)
+         * while the process is still ptrace-stopped was observed to hang
+         * this debugger's waitpid() indefinitely: on this kernel, a signal
+         * delivered through ptrace's own resumption mechanism only reliably
+         * affects the specific thread that was ptrace-stopped, so the task
+         * as a whole never finishes tearing down. Detaching first (PT_DETACH
+         * — "like PT_CONTINUE, but no longer traced") sidesteps that
+         * entirely: the process goes back to being an ordinary child, and a
+         * plain kill()+waitpid() on it behaves exactly as it would for any
+         * non-traced process. */
+        (void)ptrace(PT_DETACH, dbg->pid, (caddr_t)1, 0);
+
+        if (kill(dbg->pid, SIGKILL) == -1 && errno != ESRCH) {
+            perror("kill(SIGKILL)");
             return -1;
         }
         if (cdbg_process_wait(dbg->pid, &dbg->wait_status) != 0) {
@@ -533,6 +545,8 @@ int cdbg_continue(cdbg_t *dbg)
         return 0;
     }
 
+    (void)cdbg_threads_resume_others(dbg->pid, dbg->current_tid);
+
     fprintf(stderr, "[debug] cdbg_continue: calling PT_CONTINUE\n");
     if (ptrace(PT_CONTINUE, dbg->pid, (caddr_t)1, 0) == -1) {
         perror("ptrace(PT_CONTINUE)");
@@ -545,6 +559,11 @@ int cdbg_continue(cdbg_t *dbg)
 
 int cdbg_single_step(cdbg_t *dbg)
 {
+    /* NOTE: ptrace does not stop sibling threads automatically when one
+     * thread single-steps; freezing them with Mach thread_suspend around a
+     * ptrace step/continue was found to make this kernel's waitpid() hang
+     * intermittently on multi-threaded debuggees, so siblings are left
+     * running freely instead (a known limitation — see docs). */
     if (ptrace(PT_STEP, dbg->pid, (caddr_t)1, 0) == -1) {
         perror("ptrace(PT_STEP)");
         return -1;
@@ -828,37 +847,25 @@ static void print_disassembly_at_pc(cdbg_t *dbg, uintptr_t pc)
     print_memory_disassembly(dbg, pc);
 }
 
-static uint64_t get_primary_thread_id(pid_t pid)
+/* Returns the tid that regs/print/tb/etc. currently operate on: the
+ * explicitly selected thread, or (if none has been selected yet) whichever
+ * thread task_threads() reports first. */
+static uint64_t resolve_display_tid(const cdbg_t *dbg)
 {
-    mach_port_t task = MACH_PORT_NULL;
-    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
-        return 0;
+    if (dbg->current_tid != 0) {
+        return dbg->current_tid;
     }
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t count = 0;
-    kern_return_t kr = task_threads(task, &threads, &count);
-    mach_port_deallocate(mach_task_self(), task);
-    if (kr != KERN_SUCCESS || count == 0) {
-        return 0;
+    cdbg_thread_entry_t primary;
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, &primary, 1, &count) == 0 && count > 0) {
+        return primary.tid;
     }
-    thread_identifier_info_data_t info;
-    mach_msg_type_number_t info_count = THREAD_IDENTIFIER_INFO_COUNT;
-    uint64_t tid = 0;
-    if (thread_info(threads[0], THREAD_IDENTIFIER_INFO,
-                    (thread_info_t)&info, &info_count) == KERN_SUCCESS) {
-        tid = info.thread_id;
-    }
-    for (mach_msg_type_number_t i = 0; i < count; i++) {
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                  count * sizeof(thread_act_t));
-    return tid;
+    return 0;
 }
 
 static void print_stop_header(const cdbg_t *dbg)
 {
-    uint64_t tid = get_primary_thread_id(dbg->pid);
+    uint64_t tid = resolve_display_tid(dbg);
     if (tid != 0) {
         printf("[PID: %d  TID: %llu]\n",
                (int)dbg->pid, (unsigned long long)tid);
@@ -1026,7 +1033,7 @@ int cdbg_frame_up(cdbg_t *dbg)
         return -1;
     }
 
-    if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+    if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
         return -1;
     }
 
@@ -1038,7 +1045,7 @@ int cdbg_frame_up(cdbg_t *dbg)
 
 int cdbg_refresh_regs(cdbg_t *dbg)
 {
-    return cdbg_regs_get(dbg->pid, &dbg->regs);
+    return cdbg_regs_get(dbg->pid, dbg->current_tid, &dbg->regs);
 }
 
 void cdbg_print_regs(const cdbg_t *dbg)
@@ -1069,7 +1076,7 @@ static int handle_breakpoint_hit(cdbg_t *dbg, size_t index)
 
     if (bp->addr > 0) {
         (void)cdbg_regs_set_pc(&dbg->regs, bp->addr);
-        if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+        if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
             return -1;
         }
     }
@@ -1116,18 +1123,55 @@ static int find_watchpoint_hit(cdbg_t *dbg, uintptr_t fault_addr, size_t *index_
     return -1;
 }
 
+/* ARM64 debug registers are per-thread state, so a watchpoint must be armed
+ * on every thread that should trigger it. Arms `wp` on every thread known
+ * to exist right now; rolls back on partial failure. */
+static int arm_watchpoint_all_threads(cdbg_t *dbg, cdbg_watchpoint_t *wp)
+{
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (cdbg_watch_arm(dbg->pid, threads[i].tid, wp->slot, wp->addr, wp->size,
+                           wp->kind) != 0) {
+            for (size_t j = 0; j < i; j++) {
+                (void)cdbg_watch_disarm(dbg->pid, threads[j].tid, wp->slot);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void disarm_watchpoint_all_threads(cdbg_t *dbg, cdbg_watchpoint_t *wp)
+{
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        (void)cdbg_watch_disarm(dbg->pid, threads[i].tid, wp->slot);
+    }
+}
+
 /* ARM64 watchpoint exceptions leave the PC at the address of the instruction
  * that triggered them (not the following one), so simply continuing would
- * retrigger the same watchpoint forever. Disarm every enabled watchpoint,
- * single-step past the access, then re-arm them all before handing control
- * back. All slots are disarmed (not just the one that matched) because a
- * single wide load/store can straddle two adjacent watched granules; leaving
- * a neighbor armed during the step could retrap on the very same instruction. */
+ * retrigger the same watchpoint forever. Disarm every enabled watchpoint on
+ * every thread, single-step past the access on the thread that hit, then
+ * re-arm them all (including on any thread that appeared since) before
+ * handing control back. All slots are disarmed (not just the one that
+ * matched) because a single wide load/store can straddle two adjacent
+ * watched granules; leaving a neighbor armed during the step could retrap on
+ * the very same instruction. */
 static int step_past_all_watchpoints(cdbg_t *dbg)
 {
     for (size_t i = 0; i < dbg->watchpoint_count; i++) {
         if (dbg->watchpoints[i].enabled) {
-            (void)cdbg_watch_disarm(dbg->pid, dbg->watchpoints[i].slot);
+            disarm_watchpoint_all_threads(dbg, &dbg->watchpoints[i]);
         }
     }
 
@@ -1145,7 +1189,7 @@ static int step_past_all_watchpoints(cdbg_t *dbg)
     for (size_t i = 0; i < dbg->watchpoint_count; i++) {
         cdbg_watchpoint_t *wp = &dbg->watchpoints[i];
         if (wp->enabled) {
-            if (cdbg_watch_arm(dbg->pid, wp->slot, wp->addr, wp->size, wp->kind) != 0) {
+            if (arm_watchpoint_all_threads(dbg, wp) != 0) {
                 return -1;
             }
         }
@@ -1225,7 +1269,7 @@ static bool try_report_watchpoint_hit(cdbg_t *dbg)
     uint64_t far = 0;
     uint32_t esr = 0;
     bool is_write = false;
-    if (cdbg_regs_get_exception_state(dbg->pid, &far, &esr) != 0 ||
+    if (cdbg_regs_get_exception_state(dbg->pid, dbg->current_tid, &far, &esr) != 0 ||
         !cdbg_watch_is_watchpoint_esr(esr, &is_write)) {
         return false;
     }
@@ -1239,8 +1283,62 @@ static bool try_report_watchpoint_hit(cdbg_t *dbg)
     return true;
 }
 
+/* ptrace stops the whole process as a unit, but only one thread actually
+ * executed the trap; scan every thread's PC to find which one hit a known
+ * breakpoint. Returns 0 (never a valid thread_id) if none matches. */
+static uint64_t find_breakpoint_hit_thread(cdbg_t *dbg)
+{
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (dbg->breakpoint_count == 0 ||
+        cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (cdbg_bp_is_trap(threads[i].pc, dbg->breakpoints, dbg->breakpoint_count)) {
+            return threads[i].tid;
+        }
+    }
+    return 0;
+}
+
+/* Same idea for watchpoints: the ARM64 exception state (FAR/ESR) is
+ * per-thread, so check every thread's exception state for one that looks
+ * like a watchpoint debug exception. */
+static uint64_t find_watchpoint_hit_thread(cdbg_t *dbg)
+{
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (dbg->watchpoint_count == 0 ||
+        cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        uint64_t far = 0;
+        uint32_t esr = 0;
+        if (cdbg_regs_get_exception_state(dbg->pid, threads[i].tid, &far, &esr) == 0 &&
+            cdbg_watch_is_watchpoint_esr(esr, NULL)) {
+            return threads[i].tid;
+        }
+    }
+    return 0;
+}
+
 static int report_stop(cdbg_t *dbg)
 {
+    /* Any thread may have caused this stop; find it and select it before
+     * refreshing dbg->regs, so the rest of this function (and the hit
+     * handlers it calls) observe the thread that actually stopped. */
+    uint64_t hit_tid = find_breakpoint_hit_thread(dbg);
+    if (hit_tid == 0) {
+        hit_tid = find_watchpoint_hit_thread(dbg);
+    }
+    if (hit_tid != 0) {
+        dbg->current_tid = hit_tid;
+    }
+
+    (void)cdbg_threads_suspend_others(dbg->pid, dbg->current_tid);
+
     if (cdbg_refresh_regs(dbg) != 0) {
         return -1;
     }
@@ -3027,7 +3125,7 @@ static int cmd_set(cdbg_t *dbg, char *args)
         if (cdbg_refresh_regs(dbg) != 0) {
             return -1;
         }
-        if (cdbg_regs_set_by_name(dbg->pid, &dbg->regs, reg_name,
+        if (cdbg_regs_set_by_name(dbg->pid, dbg->current_tid, &dbg->regs, reg_name,
                                    reg_result.value, reg_result.is_float,
                                    reg_result.fvalue) != 0) {
             fprintf(stderr, "Unknown register: %s\n", reg_name);
@@ -3303,10 +3401,99 @@ static int cmd_show_watchpoints(const cdbg_t *dbg)
     return 0;
 }
 
+static void format_pc_location(cdbg_t *dbg, uintptr_t pc, char *out, size_t out_size)
+{
+    uintptr_t offset = 0;
+    const cdbg_sym_entry_t *sym = lookup_symbol_for_pc(&dbg->syms, pc, &offset);
+
+    char loc[CDBG_LINENO_MAX_FILE + 32];
+    loc[0] = '\0';
+    char file[CDBG_LINENO_MAX_FILE];
+    uint32_t line = 0;
+    if (cdbg_lineno_line_at_pc(&dbg->lineno, pc, file, sizeof(file), &line) == 0) {
+        snprintf(loc, sizeof(loc), " at %s:%u", file, line);
+    }
+
+    if (sym != NULL && offset != 0) {
+        snprintf(out, out_size, "%s + %lu%s", display_sym_name(sym),
+                 (unsigned long)offset, loc);
+    } else {
+        snprintf(out, out_size, "%s%s", display_sym_name(sym), loc);
+    }
+}
+
+static int cmd_show_threads(cdbg_t *dbg)
+{
+    if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0 ||
+        count == 0) {
+        fputs("Could not list threads\n", stderr);
+        return -1;
+    }
+
+    uint64_t current = resolve_display_tid(dbg);
+
+    printf("%-4s %-3s %-20s %-18s  %s\n", "Num", "Cur", "TID", "PC", "Location");
+    for (size_t i = 0; i < count; i++) {
+        char location[CDBG_LINENO_MAX_FILE + 64];
+        format_pc_location(dbg, threads[i].pc, location, sizeof(location));
+        printf("%-4zu %-3s %-20llu 0x%016lx  %s\n", i,
+               threads[i].tid == current ? "*" : "",
+               (unsigned long long)threads[i].tid, (unsigned long)threads[i].pc,
+               location);
+    }
+    return 0;
+}
+
+static int cmd_thread(cdbg_t *dbg, const char *arg)
+{
+    if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    uint64_t number = 0;
+    if (parse_u64(arg, &number) != 0) {
+        fprintf(stderr, "Invalid thread number: %s\n", arg);
+        return -1;
+    }
+
+    cdbg_thread_entry_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        fputs("Could not list threads\n", stderr);
+        return -1;
+    }
+    if (number >= count) {
+        fprintf(stderr, "No thread number %llu\n", (unsigned long long)number);
+        return -1;
+    }
+
+    dbg->current_tid = threads[number].tid;
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    char location[CDBG_LINENO_MAX_FILE + 64];
+    format_pc_location(dbg, pc, location, sizeof(location));
+    printf("Switched to thread %llu (tid %llu): 0x%016lx in %s\n",
+           (unsigned long long)number, (unsigned long long)dbg->current_tid,
+           (unsigned long)pc, location);
+    print_stop_location(dbg, pc);
+    return 0;
+}
+
 static int cmd_show(cdbg_t *dbg, char *args)
 {
     if (args == NULL) {
-        fputs("Usage: show locals|args|globals|bp|wp\n", stderr);
+        fputs("Usage: show locals|args|globals|bp|wp|threads\n", stderr);
         return -1;
     }
 
@@ -3316,6 +3503,9 @@ static int cmd_show(cdbg_t *dbg, char *args)
     }
     if (strcmp(args, "wp") == 0) {
         return cmd_show_watchpoints(dbg);
+    }
+    if (strcmp(args, "threads") == 0) {
+        return cmd_show_threads(dbg);
     }
 
     if (dbg->state != CDBG_STATE_STOPPED) {
@@ -3332,7 +3522,7 @@ static int cmd_show(cdbg_t *dbg, char *args)
         scope = CDBG_SHOW_GLOBALS;
     } else {
         fprintf(stderr, "Unknown show option: %s\n", args);
-        fputs("Usage: show locals|args|globals|bp|wp\n", stderr);
+        fputs("Usage: show locals|args|globals|bp|wp|threads\n", stderr);
         return -1;
     }
 
@@ -3532,14 +3722,16 @@ static const cdbg_help_entry_t k_help_entries[] = {
     {
         "Inspection",
         "show",
-        "show locals|args|globals|bp|wp",
-        "Print local variables, arguments, global variables, breakpoints, or watchpoints.",
+        "show locals|args|globals|bp|wp|threads",
+        "Print local variables, arguments, global variables, breakpoints, "
+        "watchpoints, or threads.",
         "Subcommands:\n"
         "  show locals    Local variables of the current function\n"
         "  show args      Arguments of the current function\n"
         "  show globals   Global variables in the program\n"
         "  show bp        All breakpoints (same as 'show bp' in Breakpoints)\n"
-        "  show wp        All watchpoints (same as 'show wp' in Watchpoints)\n",
+        "  show wp        All watchpoints (same as 'show wp' in Watchpoints)\n"
+        "  show threads   All threads (same as 'thread' with no argument)\n",
     },
     {
         "Inspection",
@@ -3722,6 +3914,29 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  delwatch 0        Delete watchpoint #0\n"
         "  delwatch 0 1      Delete multiple watchpoints\n"
         "  delwatch all      Delete all watchpoints\n",
+    },
+    {
+        "Threads",
+        "thread",
+        "thread [n]",
+        "List all threads, or switch to thread <n>.",
+        "Without an argument, lists every thread of the debuggee: its number "
+        "(used to switch), thread ID, and current PC. The current thread is "
+        "marked with '*'.\n"
+        "\n"
+        "With a number, switches the current thread; subsequent 'regs', "
+        "'print', 'set', 'tb', 'up', and 'step'/'next'/'si' all operate on "
+        "that thread. Breakpoints and 'continue' are unaffected by thread "
+        "selection (they apply process-wide); 'step'/'next'/'si' only "
+        "advance the selected thread, freezing the others for the duration "
+        "of that single step.\n"
+        "\n"
+        "When a breakpoint or watchpoint fires, the thread that actually "
+        "triggered it is automatically selected.\n"
+        "\n"
+        "Examples:\n"
+        "  thread        List all threads\n"
+        "  thread 1      Switch to thread #1\n",
     },
     {
         "Settings",
@@ -4295,9 +4510,7 @@ static int delete_watchpoint_at(cdbg_t *dbg, size_t index)
 
     cdbg_watchpoint_t *wp = &dbg->watchpoints[index];
     if (dbg->pid > 0 && dbg->state != CDBG_STATE_IDLE) {
-        if (cdbg_watch_disarm(dbg->pid, wp->slot) != 0) {
-            return -1;
-        }
+        disarm_watchpoint_all_threads(dbg, wp);
     }
 
     for (size_t i = index + 1; i < dbg->watchpoint_count; i++) {
@@ -4468,22 +4681,23 @@ static int cmd_watch(cdbg_t *dbg, char *expr, cdbg_watch_kind_t kind)
         return -1;
     }
 
-    if (cdbg_watch_arm(dbg->pid, slot, addr, size, kind) != 0) {
-        fprintf(stderr,
-                "Cannot set watchpoint on \"%s\" at 0x%lx: unsupported "
-                "address/size, or no more hardware watchpoints on this CPU\n",
-                expr, (unsigned long)addr);
-        return -1;
-    }
-
     size_t index = dbg->watchpoint_count;
     cdbg_watchpoint_t *wp = &dbg->watchpoints[index];
     memset(wp, 0, sizeof(*wp));
     wp->addr = addr;
     wp->size = size;
     wp->kind = kind;
-    wp->enabled = true;
     wp->slot = slot;
+
+    if (arm_watchpoint_all_threads(dbg, wp) != 0) {
+        fprintf(stderr,
+                "Cannot set watchpoint on \"%s\" at 0x%lx: unsupported "
+                "address/size, or no more hardware watchpoints on this CPU\n",
+                expr, (unsigned long)addr);
+        memset(wp, 0, sizeof(*wp));
+        return -1;
+    }
+    wp->enabled = true;
     snprintf(wp->expr, sizeof(wp->expr), "%s", expr);
 
     uint64_t initial_value = 0;
@@ -4696,6 +4910,13 @@ int cdbg_repl(cdbg_t *dbg)
                 fputs("Usage: x <addr> [count]\n", stderr);
             } else {
                 (void)cmd_examine(dbg, cmd.arg1, cmd.arg2);
+            }
+            break;
+        case CDBG_CMD_THREAD:
+            if (cmd.arg1 == NULL) {
+                (void)cmd_show_threads(dbg);
+            } else {
+                (void)cmd_thread(dbg, cmd.arg1);
             }
             break;
         case CDBG_CMD_KILL:

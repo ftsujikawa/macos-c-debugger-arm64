@@ -25,13 +25,15 @@ typedef struct cdbg_watchpoint {
     bool has_last_value;
 } cdbg_watchpoint_t;
 
-/* Programs hardware watchpoint register `slot` (0..CDBG_MAX_WATCHPOINTS-1) on the
- * debuggee's primary thread to trap on accesses of `kind` to [addr, addr+size).
- * Returns -1 if size/alignment is unsupported or the slot does not exist in
- * hardware. */
-int cdbg_watch_arm(pid_t pid, int slot, uintptr_t addr, size_t size,
+/* Programs hardware watchpoint register `slot` (0..CDBG_MAX_WATCHPOINTS-1) on
+ * the given thread (tid == 0 means the primary thread) to trap on accesses
+ * of `kind` to [addr, addr+size). Each thread has its own independent debug
+ * registers, so a watchpoint must be armed on every thread that should
+ * trigger it. Returns -1 if size/alignment is unsupported or the slot does
+ * not exist in hardware. */
+int cdbg_watch_arm(pid_t pid, uint64_t tid, int slot, uintptr_t addr, size_t size,
                    cdbg_watch_kind_t kind);
-int cdbg_watch_disarm(pid_t pid, int slot);
+int cdbg_watch_disarm(pid_t pid, uint64_t tid, int slot);
 
 bool cdbg_watch_addr_hit(const cdbg_watchpoint_t *wp, uintptr_t fault_addr);
 

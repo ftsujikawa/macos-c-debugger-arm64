@@ -57,6 +57,7 @@ static char *cmd_strdup(const char *text)
 "lists"                    { BEGIN(TOKENS); return KW_LISTS; }
 "syms"                     { BEGIN(TOKENS); return KW_SYMS; }
 "sym"                      { BEGIN(TOKENS); return KW_SYMS; }
+"thread"                   { BEGIN(TOKENS); return KW_THREAD; }
 
 "continue"                 { BEGIN(IGNORE_REST); return KW_CONTINUE; }
 "c"                        { BEGIN(IGNORE_REST); return KW_CONTINUE; }

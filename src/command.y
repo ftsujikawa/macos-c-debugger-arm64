@@ -27,7 +27,7 @@ int cmd_parse(void);
 %token KW_HELP KW_RUN KW_CONTINUE KW_STEP KW_SI KW_NEXT KW_UP KW_REGS
 %token KW_PRINT KW_SET KW_SHOW KW_TB KW_LEAKS KW_BREAK KW_DEL
 %token KW_WATCH KW_RWATCH KW_AWATCH KW_DELWATCH KW_DIS KW_LIST KW_LINES
-%token KW_LISTS KW_SYMS KW_X KW_KILL KW_QUIT
+%token KW_LISTS KW_SYMS KW_X KW_KILL KW_QUIT KW_THREAD
 %token KW_PRINT_FMT
 
 %type <text> opt_rawline opt_word
@@ -123,6 +123,13 @@ command:
     }
     | KW_X {
         g_cmd_result.kind = CDBG_CMD_X;
+    }
+    | KW_THREAD WORD {
+        g_cmd_result.kind = CDBG_CMD_THREAD;
+        g_cmd_result.arg1 = $2;
+    }
+    | KW_THREAD {
+        g_cmd_result.kind = CDBG_CMD_THREAD;
     }
     | KW_KILL { g_cmd_result.kind = CDBG_CMD_KILL; }
     | KW_QUIT { g_cmd_result.kind = CDBG_CMD_QUIT; }

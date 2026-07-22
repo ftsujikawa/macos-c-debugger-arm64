@@ -11,6 +11,7 @@ SRCS = src/main.c \
        src/process.c \
        src/breakpoint.c \
        src/watchpoint.c \
+       src/threads.c \
        src/memory.c \
        src/regs.c \
        src/lineno.c \
